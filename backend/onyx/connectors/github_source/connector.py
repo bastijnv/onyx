@@ -16,7 +16,6 @@ from typing import Any
 from typing import cast
 from typing import Optional
 
-import requests
 import tree_sitter
 from github import Github
 from github import RateLimitExceededException
@@ -47,7 +46,6 @@ from onyx.connectors.interfaces import SecondsSinceUnixEpoch
 from onyx.connectors.models import ConnectorMissingCredentialError
 from onyx.connectors.models import Document
 from onyx.connectors.models import DocumentFailure
-from onyx.connectors.models import Section
 from onyx.connectors.models import TextSection
 from onyx.utils.logger import setup_logger
 
@@ -156,9 +154,14 @@ class GithubConnectorStage(Enum):
 class GithubConnectorCheckpoint(ConnectorCheckpoint):
     stage: GithubConnectorStage
     curr_page: int
-
+    directory_stack: list[str] | None = None
     cached_repo_ids: list[int] | None = None
     cached_repo: SerializedRepository | None = None
+
+    # This is a workaround to allow arbitrary types in the model
+    # TODO: Remove this once we have a better solution
+    # class Config:
+    #     arbitrary_types_allowed = True
 
 
 @dataclass
@@ -180,13 +183,15 @@ class CodeChunk:
     end_line: int = 0
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
-    def to_document(self) -> dict[str, Any]:
+    def to_document(self) -> Document:
         """Convert the chunk to a document for indexing."""
         return (
             Document(
                 id=self.chunk_id,
                 sections=[
-                    Section(link=self.repo_url + self.file_path, text=self.text or "")
+                    TextSection(
+                        link=self.repo_url + self.file_path, text=self.text or ""
+                    )
                 ],
                 source=DocumentSource.GITHUB_SOURCE,
                 semantic_identifier=self.chunk_id,
@@ -197,13 +202,13 @@ class CodeChunk:
                     "repo_url": self.repo_url,
                     "file_path": self.file_path,
                     "file_type": self.file_type,
-                    "parent_class": self.parent_class,
-                    "parent_function": self.parent_function,
-                    "namespace": self.namespace,
-                    "called_functions": self.called_functions,
-                    "imports": self.imports,
-                    "start_line": self.start_line,
-                    "end_line": self.end_line,
+                    "parent_class": self.parent_class or "",
+                    "parent_function": self.parent_function or "",
+                    "namespace": self.namespace or "",
+                    "called_functions": ",".join(self.called_functions) or "",
+                    "imports": ",".join(self.imports) or "",
+                    "start_line": str(self.start_line),
+                    "end_line": str(self.end_line),
                     "source": "github",
                 },
             ),
@@ -736,9 +741,16 @@ class RecursiveCodeChunker:
         called_functions = []
         imports = []
 
+        if content.encoding != "base64":
+            logger.warning(
+                f"File {file_path} is not base64 encoded. Skipping chunking."
+            )
+            return []
+
+        file_content = content.decoded_content.decode("utf-8")
+
         if self.tree_sitter_chunker.has_parser(ext):
             try:
-                file_content = content.decoded_content.decode("utf-8")
                 code_metadata = self.tree_sitter_chunker.extract_metadata(
                     file_content, file_path
                 )
@@ -1095,30 +1107,30 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
         Returns:
             Boolean indicating if indexing was successful
         """
-        document = chunk.to_document()
+        chunk.to_document()
 
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.onyx_api_key}",
-        }
+        # headers = {
+        #     "Content-Type": "application/json",
+        #     "Authorization": f"Bearer {self.onyx_api_key}",
+        # }
 
-        try:
-            url = f"{self.onyx_api_url}/indexes/{self.index_name}/documents"
-            response = requests.post(url, headers=headers, json=document)
+        # try:
+        #     url = f"{self.onyx_api_url}/indexes/{self.index_name}/documents"
+        #     response = requests.post(url, headers=headers, json=document)
 
-            if response.status_code in (200, 201):
-                logger.debug(f"Successfully indexed {chunk.chunk_id}")
-                return True
-            else:
-                logger.error(
-                    f"Failed to index {chunk.chunk_id}: {response.status_code} - {response.text}"
-                )
-                return False
-        except Exception as e:
-            logger.error(f"Exception during indexing of {chunk.chunk_id}: {e}")
-            return False
+        #     if response.status_code in (200, 201):
+        #         logger.debug(f"Successfully indexed {chunk.chunk_id}")
+        #         return True
+        #     else:
+        #         logger.error(
+        #             f"Failed to index {chunk.chunk_id}: {response.status_code} - {response.text}"
+        #         )
+        #         return False
+        # except Exception as e:
+        #     logger.error(f"Exception during indexing of {chunk.chunk_id}: {e}")
+        #     return False
 
-    def index_chunks_batch(self, chunks: list[CodeChunk]) -> tuple[int, int]:
+    def index_chunks_batch(self, chunks: list[CodeChunk]) -> list[Document]:
         """
         Index a batch of code chunks into Onyx.
 
@@ -1133,28 +1145,29 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
 
         documents = [chunk.to_document() for chunk in chunks]
 
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.onyx_api_key}",
-        }
+        return documents
+        # headers = {
+        #     "Content-Type": "application/json",
+        #     #"Authorization": f"Bearer {self.onyx_api_key}",
+        # }
 
-        try:
-            url = f"{self.onyx_api_url}/indexes/{self.index_name}/documents/batch"
-            response = requests.post(url, headers=headers, json=documents)
+        # try:
+        #     url = f"{self.onyx_api_url}/indexes/{self.index_name}/documents/batch"
+        #     response = requests.post(url, headers=headers, json=documents)
 
-            if response.status_code in (200, 201):
-                logger.info(f"Successfully indexed batch of {len(chunks)} chunks")
-                return len(chunks), 0
-            else:
-                logger.error(
-                    f"Failed to index batch: {response.status_code} - {response.text}"
-                )
-                return 0, len(chunks)
-        except Exception as e:
-            logger.error(f"Exception during batch indexing: {e}")
-            return 0, len(chunks)
+        #     if response.status_code in (200, 201):
+        #         logger.info(f"Successfully indexed batch of {len(chunks)} chunks")
+        #         return len(chunks), 0
+        #     else:
+        #         logger.error(
+        #             f"Failed to index batch: {response.status_code} - {response.text}"
+        #         )
+        #         return 0, len(chunks)
+        # except Exception as e:
+        #     logger.error(f"Exception during batch indexing: {e}")
+        #     return 0, len(chunks)
 
-    def process_content(self, content: ContentFile) -> dict[str, Any]:
+    def process_content_into_documents(self, content: ContentFile) -> list[Document]:
         """
         Process a single file and index its chunks.
 
@@ -1179,12 +1192,12 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
         stats["chunks_created"] = len(chunks)
 
         # Index the chunks
-        indexed, failures = self.index_chunks_batch(chunks)
-        stats["chunks_indexed"] = indexed
-        stats["errors"] = failures
-        stats["status"] = "success" if failures == 0 else "partial_failure"
+        documents = self.index_chunks_batch(chunks)
+        stats["chunks_indexed"] = len(documents)
+        # stats["errors"] = failures
+        # stats["status"] = "success" if failures == 0 else "partial_failure"
 
-        return stats
+        return documents
 
     def process_file(
         self, file_path: str, repo_name: str, repo_url: str
@@ -1227,10 +1240,10 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
         stats["chunks_created"] = len(chunks)
 
         # Index the chunks
-        indexed, failures = self.index_chunks_batch(chunks)
-        stats["chunks_indexed"] = indexed
-        stats["errors"] = failures
-        stats["status"] = "success" if failures == 0 else "partial_failure"
+        documents = self.index_chunks_batch(chunks)
+        stats["chunks_indexed"] = len(documents)
+        # stats["errors"] = failures
+        # stats["status"] = "success" if failures == 0 else "partial_failure"
 
         return stats
 
@@ -1640,57 +1653,64 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
             # issues to get, we move on to the FILES stage
             checkpoint.stage = GithubConnectorStage.FILES
             checkpoint.curr_page = 0
+
+        checkpoint.stage = GithubConnectorStage.FILES
+
         if self.include_files and checkpoint.stage == GithubConnectorStage.FILES:
             logger.info(f"Fetching source files for repo: {repo.name}")
-            contents = repo.get_contents("")
-
             doc_batch = []
-            contents_batch = _get_batch_rate_limited(
-                contents, checkpoint.curr_page, self.github_client
-            )
-            checkpoint.curr_page += 1
-            done_with_contents = False
-            for content in cast(list[ContentFile], contents_batch):
-                if (
-                    start is not None
-                    and content.updated_at.replace(tzinfo=timezone.utc) < start
-                ):
-                    continue
-                    # yield from doc_batch
-                    # done_with_contents = True
-                    # break
-                # Skip files updated after the end date
-                if (
-                    end is not None
-                    and content.updated_at.replace(tzinfo=timezone.utc) > end
-                ):
-                    continue
+            # Initialize the stack with the root directory if not already in the checkpoint
+            if (
+                not hasattr(checkpoint, "directory_stack")
+                or checkpoint.directory_stack is None
+            ):
+                checkpoint.directory_stack = [""]
 
-                if content.pull_request is not None:
-                    # PRs are handled separately
-                    continue
+            while checkpoint.directory_stack:
+                current_path = (
+                    checkpoint.directory_stack.pop()
+                )  # Get the current directory path
+                contents = repo.get_contents(
+                    current_path
+                )  # Fetch contents of the directory
 
-                if content.issue is not None:
-                    # Issues are handled separately
-                    continue
+                checkpoint.curr_page += 1
+                done_with_contents = False
+                for content in contents:
+                    if start is not None and content.last_modified_datetime < start:
+                        yield from doc_batch
+                        done_with_contents = True
+                        break
+                    # Skip files updated after the end date
+                    if end is not None and content.last_modified_datetime > end:
+                        continue
 
-                try:
-                    doc_batch.append(self.process_content(content))
-                except Exception as e:
-                    error_msg = f"Error converting content to document: {e}"
-                    logger.exception(error_msg)
-                    yield ConnectorFailure(
-                        failed_document=DocumentFailure(
-                            document_id=str(issue.id),
-                            document_link=issue.html_url,
-                        ),
-                        failure_message=error_msg,
-                        exception=e,
-                    )
-                    continue
+                    if content.type == "dir":
+                        # Add the directory's path to the stack
+                        checkpoint.directory_stack.append(content.path)
+                    elif self.should_process_file(content.path) is False:
+                        continue
+                    else:
+                        try:
+                            doc_batch.append(
+                                self.process_content_into_documents(content)
+                            )
+                        except Exception as e:
+                            error_msg = f"Error converting content to document: {e}"
+                            logger.exception(error_msg)
+                            yield ConnectorFailure(
+                                failed_document=DocumentFailure(
+                                    document_id=str(issue.id),
+                                    document_link=issue.html_url,
+                                ),
+                                failure_message=error_msg,
+                                exception=e,
+                            )
+                            continue
 
-            # if we found any issues on the page, yield them and return the checkpoint
-            if not done_with_contents and len(contents_batch) > 0:
+            # if we found any files on the current directory,
+            # yield them and return the checkpoint
+            if not done_with_contents and len(checkpoint.directory_stack) > 0:
                 yield from doc_batch
                 return checkpoint
 
@@ -1869,6 +1889,7 @@ if __name__ == "__main__":
     connector = GithubSourceConnector(
         repo_owner=os.environ["REPO_OWNER"],
         repositories=os.environ["REPOSITORIES"],
+        excluded_extensions=["jpg", "jpeg", "png", "gif", "mp4", "avi", "mov"],
     )
     connector.load_credentials(
         {"github_access_token": os.environ["ACCESS_TOKEN_GITHUB"]}
