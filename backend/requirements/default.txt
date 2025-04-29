@@ -104,5 +104,14 @@ tree_sitter_python==0.23.6
 tree_sitter_javascript==0.23.1
 tree_sitter_typescript==0.23.2
 tree_sitter_cpp==0.23.4
+tree_sitter_c==0.23.2
 tree-sitter-c-sharp==0.23.1
+tree-sitter-markdown==0.3.2
+tree-sitter-html==0.23.2
+tree-sitter-json==0.23.0
+tree-sitter-ruby==0.23.1
+tree-sitter-scss==1.0.0
+tree-sitter-sql==0.3.7
+tree-sitter-xml==0.7.0
+tree-sitter-yaml==0.7.0
 gitpython==3.1.44

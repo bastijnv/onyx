@@ -29,7 +29,7 @@ from github.Requester import Requester
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 from tree_sitter import Language
-from tree_sitter import Parser
+from tree_sitter import Query
 from typing_extensions import override
 
 from onyx.configs.app_configs import GITHUB_CONNECTOR_BASE_URL
@@ -185,101 +185,209 @@ class CodeChunk:
 
     def to_document(self) -> Document:
         """Convert the chunk to a document for indexing."""
-        return (
-            Document(
-                id=self.chunk_id,
-                sections=[
-                    TextSection(
-                        link=self.repo_url + self.file_path, text=self.text or ""
-                    )
-                ],
-                source=DocumentSource.GITHUB_SOURCE,
-                semantic_identifier=self.chunk_id,
-                # updated_at is UTC time but is timezone unaware
-                doc_updated_at=self.updated_at.replace(tzinfo=timezone.utc),
-                metadata={
-                    "repository": self.repository,
-                    "repo_url": self.repo_url,
-                    "file_path": self.file_path,
-                    "file_type": self.file_type,
-                    "parent_class": self.parent_class or "",
-                    "parent_function": self.parent_function or "",
-                    "namespace": self.namespace or "",
-                    "called_functions": ",".join(self.called_functions) or "",
-                    "imports": ",".join(self.imports) or "",
-                    "start_line": str(self.start_line),
-                    "end_line": str(self.end_line),
-                    "source": "github",
-                },
-            ),
+        return Document(
+            id=self.chunk_id,
+            sections=[
+                TextSection(link=self.repo_url + self.file_path, text=self.text or "")
+            ],
+            source=DocumentSource.GITHUB_SOURCE,
+            semantic_identifier=self.chunk_id,
+            # updated_at is UTC time but is timezone unaware
+            doc_updated_at=self.updated_at.replace(tzinfo=timezone.utc),
+            metadata={
+                "repository": self.repository,
+                "repo_url": self.repo_url,
+                "file_path": self.file_path,
+                "file_type": self.file_type,
+                "parent_class": self.parent_class or "",
+                "parent_function": self.parent_function or "",
+                "namespace": self.namespace or "",
+                "called_functions": ",".join(self.called_functions) or "",
+                "imports": ",".join(self.imports) or "",
+                "start_line": str(self.start_line),
+                "end_line": str(self.end_line),
+                "source": "github",
+            },
         )
-        # return {
-        #     "id": self.chunk_id,
-        #     "text": self.text,
-        #     "metadata": {
-        #         "repository": self.repository,
-        #         "repo_url": self.repo_url,
-        #         "file_path": self.file_path,
-        #         "file_type": self.file_type,
-        #         "parent_class": self.parent_class,
-        #         "parent_function": self.parent_function,
-        #         "namespace": self.namespace,
-        #         "called_functions": self.called_functions,
-        #         "imports": self.imports,
-        #         "start_line": self.start_line,
-        #         "end_line": self.end_line,
-        #         "source": "github"
-        #     }
-        # }
 
 
 class TreeSitterChunker:
     """Handle code parsing using tree-sitter for better code understanding."""
 
-    # Language file paths - these need to be compiled and available
-    LANGUAGE_LIBS = {
-        ".py": "tree-sitter-python",
-        ".js": "tree-sitter-javascript",
-        ".ts": "tree-sitter-typescript",
-        ".tsx": "tree-sitter-typescript",
-        ".java": "tree-sitter-java",
-        ".c": "tree-sitter-c",
-        ".cpp": "tree-sitter-cpp",
-        ".go": "tree-sitter-go",
-        ".rb": "tree-sitter-ruby",
-        ".php": "tree-sitter-php",
-        ".cs": "tree-sitter-c-sharp",
-        ".rs": "tree-sitter-rust",
-    }
-
-    def __init__(self, language_dir: str = "./tree-sitter-langs"):
+    def __init__(self, language_dir: str = "./tree-sitter-grammars"):
         """
         Initialize the TreeSitterChunker.
 
         Args:
             language_dir: Directory containing compiled tree-sitter language libraries
         """
+        # Convert relative path to absolute path
+        if not os.path.isabs(language_dir):
+            # Get the directory where the connector script is located
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            language_dir = os.path.abspath(os.path.join(current_dir, language_dir))
+
         self.language_dir = language_dir
         self.parsers = {}
+
+        # Debugging: Log the absolute path
+        logger.info(f"Tree-sitter language directory path: {self.language_dir}")
+
         self._init_parsers()
 
     def _init_parsers(self):
         """Initialize parsers for supported languages."""
-        if not os.path.exists(self.language_dir):
-            logger.warning(
-                f"Language directory {self.language_dir} not found. Tree-sitter parsing will be limited."
-            )
-            return
-
         try:
-            for ext, lib_name in self.LANGUAGE_LIBS.items():
-                lib_path = os.path.join(self.language_dir, f"{lib_name}.so")
-                if os.path.exists(lib_path):
-                    lang = Language(lib_path, ext[1:])  # Remove dot from extension
-                    parser = Parser()
-                    parser.set_language(lang)
-                    self.parsers[ext] = parser
-                    logger.info(f"Loaded Tree-sitter parser for {ext}")
+            from tree_sitter import Parser
+
+            # Use proper Python imports to get the languages
+            languages = {}
+
+            # Import available language packages - use try/except to gracefully handle missing ones
+            try:
+                from tree_sitter_c_sharp import language as cs_language
+
+                languages[".cs"] = Language(cs_language())
+                logger.info("Loaded C# language parser")
+            except ImportError:
+                logger.debug("C# language parser not available")
+
+            try:
+                from tree_sitter_python import language as py_language
+
+                languages[".py"] = Language(py_language())
+                logger.info("Loaded Python language parser")
+            except ImportError:
+                logger.debug("Python language parser not available")
+
+            try:
+                from tree_sitter_markdown import language as md_language
+
+                languages[".md"] = Language(md_language())
+                logger.info("Loaded Markdown language parser")
+            except ImportError:
+                logger.debug("Markdown language parser not available")
+
+            try:
+                from tree_sitter_html import language as html_language
+
+                languages[".html"] = Language(html_language())
+                languages[".htm"] = Language(html_language())
+                logger.info("Loaded HTML language parser")
+            except ImportError:
+                logger.debug("HTML language parser not available")
+            except Exception as e:
+                logger.warning(f"Failed to load HTML parser: {e}")
+
+            try:
+                from tree_sitter_ruby import language as ruby_language
+
+                languages[".rb"] = Language(ruby_language())
+                languages[".rake"] = Language(ruby_language())
+                logger.info("Loaded Ruby language parser")
+            except ImportError:
+                logger.debug("Ruby language parser not available")
+            except Exception as e:
+                logger.warning(f"Failed to load Ruby parser: {e}")
+
+            try:
+                from tree_sitter_scss import language as scss_language
+
+                languages[".scss"] = Language(scss_language())
+                languages[".sass"] = Language(scss_language())
+                logger.info("Loaded SCSS language parser")
+            except ImportError:
+                logger.debug("SCSS language parser not available")
+            except Exception as e:
+                logger.warning(f"Failed to load SCSS parser: {e}")
+
+            try:
+                from tree_sitter_sql import language as sql_language
+
+                languages[".sql"] = Language(sql_language())
+                logger.info("Loaded SQL language parser")
+            except ImportError:
+                logger.debug("SQL language parser not available")
+            except Exception as e:
+                logger.warning(f"Failed to load SQL parser: {e}")
+
+            try:
+                from tree_sitter_xml import language_xml
+
+                languages[".xml"] = Language(language_xml())
+                languages[".svg"] = Language(language_xml())
+                languages[".xsd"] = Language(language_xml())
+                logger.info("Loaded XML language parser")
+            except ImportError:
+                logger.debug("XML language parser not available")
+            except Exception as e:
+                logger.warning(f"Failed to load XML parser: {e}")
+
+            try:
+                from tree_sitter_yaml import language as yaml_language
+
+                languages[".yaml"] = Language(yaml_language())
+                languages[".yml"] = Language(yaml_language())
+                logger.info("Loaded YAML language parser")
+            except ImportError:
+                logger.debug("YAML language parser not available")
+            except Exception as e:
+                logger.warning(f"Failed to load YAML parser: {e}")
+
+            try:
+                from tree_sitter_json import language as json_language
+
+                languages[".json"] = Language(json_language())
+                logger.info("Loaded JSON language parser")
+            except ImportError:
+                logger.debug("JSON language parser not available")
+            except Exception as e:
+                logger.warning(f"Failed to load JSON parser: {e}")
+
+            try:
+                from tree_sitter_javascript import language as js_language
+
+                languages[".js"] = Language(js_language())
+                languages[".jsx"] = Language(js_language())
+                logger.info("Loaded JavaScript language parser")
+            except ImportError:
+                logger.debug("JavaScript language parser not available")
+
+            try:
+                from tree_sitter_typescript import language_typescript
+                from tree_sitter_typescript import language_tsx
+
+                languages[".ts"] = Language(language_typescript())
+                languages[".tsx"] = Language(language_tsx())
+                logger.info("Loaded TypeScript language parser")
+            except ImportError:
+                logger.debug("TypeScript language parser not available")
+
+            try:
+                from tree_sitter_c import language as c_language
+
+                languages[".c"] = Language(c_language())
+                logger.info("Loaded C language parser")
+            except ImportError:
+                logger.debug("C language parser not available")
+
+            try:
+                from tree_sitter_cpp import language as cpp_language
+
+                languages[".cpp"] = Language(cpp_language())
+                languages[".hpp"] = Language(cpp_language())
+                logger.info("Loaded C++ language parser")
+            except ImportError:
+                logger.debug("C++ language parser not available")
+
+            # Create parsers for each language
+            for ext, language in languages.items():
+                parser = Parser(language)
+                self.parsers[ext] = parser
+                logger.info(f"Created parser for {ext}")
+
+        except ImportError as e:
+            logger.warning(f"Could not initialize tree-sitter: {e}")
         except Exception as e:
             logger.error(f"Error initializing tree-sitter parsers: {e}")
 
@@ -305,6 +413,9 @@ class TreeSitterChunker:
             "classes": [],
             "functions": [],
             "called_functions": [],
+            "decorators": [],
+            "namespaces": [],
+            "jsx_elements": [],
         }
 
         if ext not in self.parsers:
@@ -313,17 +424,35 @@ class TreeSitterChunker:
         try:
             parser = self.parsers[ext]
             tree = parser.parse(bytes(code, "utf8"))
-            root_node = tree.root_node
 
             # Extract imports, classes, functions based on language
-            if ext == ".py":
-                metadata = self._extract_python_metadata(root_node)
-            elif ext in (".js", ".ts", ".tsx"):
-                metadata = self._extract_js_ts_metadata(root_node)
-            elif ext in (".java"):
-                metadata = self._extract_java_metadata(root_node)
-            elif ext in (".cs"):
-                metadata = self._extract_csharp_metadata(root_node)
+            if ext == ".cs":
+                metadata = self._extract_csharp_metadata(tree)
+            elif ext == ".py":
+                metadata = self._extract_python_metadata(tree)
+            elif ext in (".ts", ".js"):
+                metadata = self._extract_js_ts_metadata(tree)
+            elif ext in (".tsx", ".jsx"):
+                metadata = self._extract_tsx_jsx_metadata(tree)
+            elif ext in (".c"):
+                metadata = self._extract_c_metadata(tree)
+            elif ext in (".cpp", ".hpp"):
+                metadata = self._extract_cpp_metadata(tree)
+
+            # elif ext in (".html", ".htm"):
+            #     metadata = self._extract_html_metadata(tree)
+            # elif ext in (".rb", ".rake"):
+            #     metadata = self._extract_ruby_metadata(tree)
+            # elif ext in (".scss", ".sass"):
+            #     metadata = self._extract_scss_metadata(tree)
+            # elif ext == ".sql":
+            #     metadata = self._extract_sql_metadata(tree)
+            # elif ext in (".xml", ".svg", ".xsd"):
+            #     metadata = self._extract_xml_metadata(tree)
+            # elif ext in (".yaml", ".yml"):
+            #     metadata = self._extract_yaml_metadata(parser, code)
+            # # elif ext == ".json":
+            # #     metadata = self._extract_json_metadata(tree)
             # Add more language-specific extractors as needed
 
         except Exception as e:
@@ -331,307 +460,172 @@ class TreeSitterChunker:
 
         return metadata
 
-    def _extract_python_metadata(self, root_node) -> dict[str, Any]:
-        """Extract metadata from Python code."""
-        metadata = {
-            "imports": [],
-            "classes": [],
-            "functions": [],
-            "called_functions": [],
-        }
+    def _extract_c_metadata(self, tree: tree_sitter.Tree) -> dict[str, Any]:
+        query = """
+        (preproc_include
+            (string) @import)
 
-        # Simple query for imports
-        import_query = """
-        (import_statement) @import
-        (import_from_statement) @import_from
-        """
-
-        # Query for classes and methods
-        class_query = """
-        (class_definition
-          name: (identifier) @class_name) @class
-        """
-
-        function_query = """
         (function_definition
-          name: (identifier) @function_name) @function
-        """
+            declarator: (function_declarator
+                declarator: (identifier) @function_name))
 
-        # Query for function calls
-        call_query = """
-        (call
-          function: (identifier) @function_call)
-        """
-
-        try:
-            # Parse imports
-            query = tree_sitter.Query(root_node.language, import_query)
-            captures = query.captures(root_node)
-            for _, node in captures:
-                metadata["imports"].append(node.text.decode("utf8"))
-
-            # Parse classes
-            query = tree_sitter.Query(root_node.language, class_query)
-            captures = query.captures(root_node)
-            for name, node in captures:
-                if name == "class_name":
-                    metadata["classes"].append(node.text.decode("utf8"))
-
-            # Parse functions
-            query = tree_sitter.Query(root_node.language, function_query)
-            captures = query.captures(root_node)
-            for name, node in captures:
-                if name == "function_name":
-                    metadata["functions"].append(node.text.decode("utf8"))
-
-            # Parse function calls
-            query = tree_sitter.Query(root_node.language, call_query)
-            captures = query.captures(root_node)
-            for name, node in captures:
-                if name == "function_call":
-                    func_name = node.text.decode("utf8")
-                    if func_name not in metadata["called_functions"]:
-                        metadata["called_functions"].append(func_name)
-
-        except Exception as e:
-            logger.warning(f"Error in Python metadata extraction: {e}")
-
-        return metadata
-
-    def _extract_js_ts_metadata(self, root_node) -> dict[str, Any]:
-        """Extract metadata from JavaScript/TypeScript code."""
-        metadata = {
-            "imports": [],
-            "classes": [],
-            "functions": [],
-            "called_functions": [],
-        }
-
-        # Simple query for imports
-        import_query = """
-        (import_statement) @import
-        (import_clause) @import_clause
-        """
-
-        # Query for classes and methods
-        class_query = """
-        (class_declaration
-          name: (identifier) @class_name) @class
-        """
-
-        function_query = """
-        (function_declaration
-          name: (identifier) @function_name) @function
-        (method_definition
-          name: (property_identifier) @method_name) @method
-        """
-
-        # Query for function calls
-        call_query = """
         (call_expression
-          function: (identifier) @function_call)
+            function: (identifier) @called_function)
         """
+        return self._extract_metadata_with_query(tree, query)
 
-        try:
-            # Parse imports
-            query = tree_sitter.Query(root_node.language, import_query)
-            captures = query.captures(root_node)
-            for _, node in captures:
-                metadata["imports"].append(node.text.decode("utf8"))
+    def _extract_cpp_metadata(self, tree: tree_sitter.Tree) -> dict[str, Any]:
+        query = """
+        (preproc_include
+            (string) @import)
 
-            # Parse classes
-            query = tree_sitter.Query(root_node.language, class_query)
-            captures = query.captures(root_node)
-            for name, node in captures:
-                if name == "class_name":
-                    metadata["classes"].append(node.text.decode("utf8"))
+        (namespace_definition
+            name: (identifier) @namespace_name)
 
-            # Parse functions
-            query = tree_sitter.Query(root_node.language, function_query)
-            captures = query.captures(root_node)
-            for name, node in captures:
-                if name in ("function_name", "method_name"):
-                    metadata["functions"].append(node.text.decode("utf8"))
+        (class_specifier
+            name: (type_identifier) @class_name)
 
-            # Parse function calls
-            query = tree_sitter.Query(root_node.language, call_query)
-            captures = query.captures(root_node)
-            for name, node in captures:
-                if name == "function_call":
-                    func_name = node.text.decode("utf8")
-                    if func_name not in metadata["called_functions"]:
-                        metadata["called_functions"].append(func_name)
+        (function_definition
+            declarator: (function_declarator
+                declarator: (identifier) @function_name))
 
-        except Exception as e:
-            logger.warning(f"Error in JS/TS metadata extraction: {e}")
+        (call_expression
+            function: (identifier) @called_function)
+        """
+        return self._extract_metadata_with_query(tree, query)
 
-        return metadata
+    def _extract_python_metadata(self, tree: tree_sitter.Tree) -> dict[str, Any]:
+        query = """
+        (import_statement
+            name: (dotted_name (identifier) @import))
 
-    def _extract_csharp_metadata(self, root_node) -> dict[str, Any]:
-        """Extract metadata from C# code."""
-        metadata = {
-            "imports": [],
-            "classes": [],
-            "functions": [],
-            "called_functions": [],
-        }
+        (import_from_statement
+            module_name: (dotted_name (identifier) @import))
 
-        # Query for using statements (imports in C#)
-        import_query = """
+        (class_definition
+            name: (identifier) @class_name)
+
+        (function_definition
+            name: (identifier) @function_name)
+
+        (call
+            function: (identifier) @called_function)
+        """
+        return self._extract_metadata_with_query(tree, query)
+
+    def _extract_tsx_jsx_metadata(self, tree: tree_sitter.Tree) -> dict[str, Any]:
+        query = """
+        ;; IMPORTS
+        (import_statement (import_clause) @import)
+
+        ;; CLASSES
+        (class_declaration name: (type_identifier) @class_name)
+
+        ;; FUNCTIONS
+        (method_definition name: (property_identifier) @function_name)
+        (function_declaration name: (identifier) @function_name)
+        (lexical_declaration
+        (variable_declarator
+            name: (identifier) @function_name
+            value: (arrow_function)))
+
+        ;; FUNCTION CALLS
+        (call_expression function: (identifier) @called_function)
+        (call_expression function: (member_expression property: (property_identifier) @called_function))
+
+        ;; JSX ELEMENTS
+        (jsx_opening_element name: (identifier) @jsx_element)
+        (jsx_self_closing_element name: (identifier) @jsx_element)
+        """
+        return self._extract_metadata_with_query(tree, query)
+
+    def _extract_js_ts_metadata(self, tree: tree_sitter.Tree) -> dict[str, Any]:
+        query = """
+        ;; IMPORTS
+        (import_statement (import_clause) @import)
+
+        ;; CLASSES
+        (class_declaration name: (type_identifier) @class_name)
+
+        ;; FUNCTIONS
+        (method_definition name: (property_identifier) @function_name)
+        (function_declaration name: (identifier) @function_name)
+
+        ;; CALLED FUNCTIONS
+        (call_expression function: (identifier) @called_function)
+        (call_expression function: (member_expression property: (property_identifier) @called_function))
+
+        ;; DECORATORS (Angular-specific)
+        (decorator (call_expression function: (identifier) @decorator_name))
+        """
+        return self._extract_metadata_with_query(tree, query)
+
+    def _extract_csharp_metadata(self, tree: tree_sitter.Tree) -> dict[str, Any]:
+        query = """
         (using_directive
-        name: (qualified_name) @namespace) @using
-        """
+        (identifier) @import)
 
-        # Query for classes
-        class_query = """
-        (class_declaration
-        name: (identifier) @class_name) @class
-        """
-
-        # Query for interfaces
-        interface_query = """
-        (interface_declaration
-        name: (identifier) @interface_name) @interface
-        """
-
-        # Query for methods
-        method_query = """
-        (method_declaration
-        name: (identifier) @method_name) @method
-        """
-
-        # Query for function calls
-        call_query = """
-        (invocation_expression
-        expression: (member_access_expression
-            name: (identifier) @function_call))
-        (invocation_expression
-        expression: (identifier) @function_call)
-        """
-
-        # Query for namespaces
-        namespace_query = """
         (namespace_declaration
-        name: (qualified_name) @namespace_name) @namespace
+            name: (identifier) @namespace_name)
+
+        (class_declaration
+            name: (identifier) @class_name)
+
+        (method_declaration
+            name: (identifier) @function_name)
+
+        (invocation_expression
+            function: (identifier) @called_function)
         """
+        return self._extract_metadata_with_query(tree, query)
 
-        try:
-            # Parse imports (using statements)
-            query = tree_sitter.Query(root_node.language, import_query)
-            captures = query.captures(root_node)
-            for name, node in captures:
-                if name == "namespace":
-                    metadata["imports"].append(f"using {node.text.decode('utf8')};")
+    def _extract_metadata_with_query(
+        self, tree: tree_sitter.Tree, query: str
+    ) -> dict[str, Any]:
+        """
+        Extract metadata from code using a tree-sitter query.
 
-            # Parse namespaces
-            query = tree_sitter.Query(root_node.language, namespace_query)
-            captures = query.captures(root_node)
-            namespace_names = []
-            for name, node in captures:
-                if name == "namespace_name":
-                    namespace_names.append(node.text.decode("utf8"))
-            if namespace_names:
-                metadata["namespace"] = namespace_names[0]
+        Args:
+            tree: The parsed tree-sitter syntax tree.
+            query: The tree-sitter query string.
 
-            # Parse classes
-            query = tree_sitter.Query(root_node.language, class_query)
-            captures = query.captures(root_node)
-            for name, node in captures:
-                if name == "class_name":
-                    metadata["classes"].append(node.text.decode("utf8"))
-
-            # Parse interfaces (also adding to classes list for simplicity)
-            query = tree_sitter.Query(root_node.language, interface_query)
-            captures = query.captures(root_node)
-            for name, node in captures:
-                if name == "interface_name":
-                    interface_name = node.text.decode("utf8")
-                    metadata["classes"].append(interface_name)
-
-            # Parse methods
-            query = tree_sitter.Query(root_node.language, method_query)
-            captures = query.captures(root_node)
-            for name, node in captures:
-                if name == "method_name":
-                    metadata["functions"].append(node.text.decode("utf8"))
-
-            # Parse function calls
-            query = tree_sitter.Query(root_node.language, call_query)
-            captures = query.captures(root_node)
-            for name, node in captures:
-                if name == "function_call":
-                    func_name = node.text.decode("utf8")
-                    if func_name not in metadata["called_functions"]:
-                        metadata["called_functions"].append(func_name)
-
-        except Exception as e:
-            logger.warning(f"Error in C# metadata extraction: {e}")
-
-        return metadata
-
-    def _extract_java_metadata(self, root_node) -> dict[str, Any]:
-        """Extract metadata from Java code."""
+        Returns:
+            A dictionary containing extracted metadata.
+        """
         metadata = {
             "imports": [],
             "classes": [],
             "functions": [],
             "called_functions": [],
+            "decorators": [],
+            "namespaces": [],
+            "jsx_elements": [],
         }
 
-        # Simple query for imports
-        import_query = """
-        (import_declaration) @import
-        """
-
-        # Query for classes and methods
-        class_query = """
-        (class_declaration
-          name: (identifier) @class_name) @class
-        """
-
-        function_query = """
-        (method_declaration
-          name: (identifier) @method_name) @method
-        """
-
-        # Query for function calls
-        call_query = """
-        (method_invocation
-          name: (identifier) @function_call)
-        """
-
         try:
-            # Parse imports
-            query = tree_sitter.Query(root_node.language, import_query)
-            captures = query.captures(root_node)
-            for _, node in captures:
-                metadata["imports"].append(node.text.decode("utf8"))
+            root_node = tree.root_node
+            parser_query = Query(tree.language, query)
+            captures = parser_query.captures(root_node)
 
-            # Parse classes
-            query = tree_sitter.Query(root_node.language, class_query)
-            captures = query.captures(root_node)
-            for name, node in captures:
-                if name == "class_name":
-                    metadata["classes"].append(node.text.decode("utf8"))
-
-            # Parse functions
-            query = tree_sitter.Query(root_node.language, function_query)
-            captures = query.captures(root_node)
-            for name, node in captures:
-                if name == "method_name":
-                    metadata["functions"].append(node.text.decode("utf8"))
-
-            # Parse function calls
-            query = tree_sitter.Query(root_node.language, call_query)
-            captures = query.captures(root_node)
-            for name, node in captures:
-                if name == "function_call":
-                    func_name = node.text.decode("utf8")
-                    if func_name not in metadata["called_functions"]:
-                        metadata["called_functions"].append(func_name)
+            for capture, nodes in captures.items():
+                for node in nodes:
+                    if capture == "import":
+                        metadata["imports"].append(node.text.decode("utf-8"))
+                    elif capture == "class_name":
+                        metadata["classes"].append(node.text.decode("utf-8"))
+                    elif capture == "function_name":
+                        metadata["functions"].append(node.text.decode("utf-8"))
+                    elif capture == "called_function":
+                        metadata["called_functions"].append(node.text.decode("utf-8"))
+                    elif capture == "decorator_name":
+                        metadata["decorators"].append(node.text.decode("utf-8"))
+                    elif capture == "jsx_element":
+                        metadata["jsx_elements"].append(node.text.decode("utf-8"))
+                    elif capture == "namespace_name":
+                        metadata["namespaces"].append(node.text.decode("utf-8"))
 
         except Exception as e:
-            logger.warning(f"Error in Java metadata extraction: {e}")
+            logger.warning(f"Error extracting metadata: {e}")
 
         return metadata
 
@@ -666,6 +660,13 @@ class RecursiveCodeChunker:
         """Initialize language-specific text splitters."""
         splitters = {}
 
+        # Create a default splitter for languages without specific support
+        default_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+            separators=["\n\n", "\n", " ", ""],
+        )
+
         # Python splitter
         splitters[".py"] = RecursiveCharacterTextSplitter.from_language(
             language="python",
@@ -673,17 +674,15 @@ class RecursiveCodeChunker:
             chunk_overlap=self.chunk_overlap,
         )
 
-        # JavaScript splitter
+        # JavaScript/TypeScript splitters
         splitters[".js"] = RecursiveCharacterTextSplitter.from_language(
             language="js", chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap
         )
-
-        # TypeScript splitter
+        splitters[".jsx"] = splitters[".js"]
         splitters[".ts"] = RecursiveCharacterTextSplitter.from_language(
-            language="js",  # Use JS splitter for TS
-            chunk_size=self.chunk_size,
-            chunk_overlap=self.chunk_overlap,
+            language="ts", chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap
         )
+        splitters[".tsx"] = splitters[".ts"]
 
         # Java splitter
         splitters[".java"] = RecursiveCharacterTextSplitter.from_language(
@@ -692,26 +691,112 @@ class RecursiveCodeChunker:
             chunk_overlap=self.chunk_overlap,
         )
 
-        # HTML splitter
+        # C# splitter
+        splitters[".cs"] = RecursiveCharacterTextSplitter.from_language(
+            language="csharp",
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+        )
+
+        # HTML splitter (XML has to use default)
         splitters[".html"] = RecursiveCharacterTextSplitter.from_language(
             language="html",
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
+        splitters[".htm"] = splitters[".html"]
 
-        # CSS splitter
-        splitters[".css"] = RecursiveCharacterTextSplitter.from_language(
-            language="html",  # Use HTML for CSS
+        # XML and related formats - use HTML as closest alternative or default
+        try:
+            # Try to use HTML as a fallback for XML formats
+            xml_splitter = RecursiveCharacterTextSplitter.from_language(
+                language="html",  # Use HTML as proxy for XML-like languages
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap,
+            )
+            splitters[".xml"] = xml_splitter
+            splitters[".svg"] = xml_splitter
+            splitters[".xsd"] = xml_splitter
+        except ValueError:
+            # If HTML isn't supported either, use default
+            splitters[".xml"] = default_splitter
+            splitters[".svg"] = default_splitter
+            splitters[".xsd"] = default_splitter
+            logger.warning(
+                "Using default splitter for XML documents (no XML/HTML support in langchain)"
+            )
+
+        # Ruby splitter
+        splitters[".rb"] = RecursiveCharacterTextSplitter.from_language(
+            language="ruby",
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+        )
+        splitters[".rake"] = splitters[".rb"]
+
+        # SCSS/CSS splitters - use default as no direct support
+        splitters[".scss"] = default_splitter
+        splitters[".sass"] = default_splitter
+        splitters[".css"] = default_splitter
+        logger.info("Using default splitter for CSS/SCSS documents")
+
+        # SQL splitter - no direct support, use default
+        splitters[".sql"] = default_splitter
+        logger.info("Using default splitter for SQL documents")
+
+        # YAML splitter - no direct support, use default
+        splitters[".yaml"] = default_splitter
+        splitters[".yml"] = default_splitter
+        logger.info("Using default splitter for YAML documents")
+
+        # JSON splitter - no direct support, use default
+        splitters[".json"] = default_splitter
+        logger.info("Using default splitter for JSON documents")
+
+        # C/C++ splitters
+        splitters[".c"] = RecursiveCharacterTextSplitter.from_language(
+            language="c",
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+        )
+        splitters[".cpp"] = RecursiveCharacterTextSplitter.from_language(
+            language="cpp",
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+        )
+        splitters[".hpp"] = splitters[".cpp"]
+
+        # Markdown splitter
+        splitters[".md"] = RecursiveCharacterTextSplitter.from_language(
+            language="markdown",
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+        )
+        splitters[".markdown"] = splitters[".md"]
+
+        # Go splitter
+        splitters[".go"] = RecursiveCharacterTextSplitter.from_language(
+            language="go",
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
 
-        # Default text splitter
-        splitters["default"] = RecursiveCharacterTextSplitter(
+        # PHP splitter
+        splitters[".php"] = RecursiveCharacterTextSplitter.from_language(
+            language="php",
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
-            separators=["\n\n", "\n", " ", ""],
         )
+
+        # Rust splitter
+        splitters[".rs"] = RecursiveCharacterTextSplitter.from_language(
+            language="rust",
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+        )
+
+        # Default text splitter for all other file types
+        splitters["default"] = default_splitter
 
         return splitters
 
@@ -738,6 +823,7 @@ class RecursiveCodeChunker:
         # Extract code metadata if possible
         namespace = None
         parent_class = None
+        parent_function = None
         called_functions = []
         imports = []
 
@@ -756,16 +842,30 @@ class RecursiveCodeChunker:
                 )
                 imports = code_metadata.get("imports", [])
                 classes = code_metadata.get("classes", [])
+                functions = code_metadata.get("functions", [])
                 parent_class = classes[0] if classes else None
+                parent_function = functions[0] if functions else None
                 called_functions = code_metadata.get("called_functions", [])
 
+                # If namespace is explicitly provided in metadata
+                if "namespace" in code_metadata:
+                    namespace = code_metadata["namespace"]
                 # Try to extract namespace from imports or file structure
-                if imports:
+                elif imports:
                     # Simple heuristic: use the first import's package as namespace
                     first_import = imports[0]
-                    match = re.search(r"import\s+([a-zA-Z0-9_.]+)", first_import)
-                    if match:
-                        namespace = match.group(1).split(".")[0]
+                    if isinstance(first_import, str):
+                        match = re.search(
+                            r"import\s+([a-zA-Z0-9_.]+)|from\s+([a-zA-Z0-9_.]+)|package\s+([a-zA-Z0-9_.]+)|namespace\s+([a-zA-Z0-9_.]+)",
+                            first_import,
+                        )
+                        if match:
+                            # Take the first matching group that isn't None
+                            namespace = next(
+                                (g for g in match.groups() if g is not None), None
+                            )
+                            if namespace:
+                                namespace = namespace.split(".")[0]
 
                 if not namespace:
                     # Use directory structure for namespace
@@ -803,14 +903,17 @@ class RecursiveCodeChunker:
                     file_path=file_path,
                     chunk_id=chunk_id,
                     repository=content.repository.name,
-                    repo_url=content.repository.url,
+                    repo_url=content.repository.html_url,  # Use html_url for browser URL
                     file_type=file_type,
                     parent_class=parent_class,
+                    parent_function=parent_function,
                     namespace=namespace,
                     called_functions=called_functions,
                     imports=imports,
                     start_line=start_line,
                     end_line=end_line,
+                    updated_at=content.last_modified_datetime
+                    or datetime.now(timezone.utc),
                 )
                 chunks.append(chunk)
 
@@ -823,14 +926,16 @@ class RecursiveCodeChunker:
                 file_path=file_path,
                 chunk_id=chunk_id,
                 repository=content.repository.name,
-                repo_url=content.repository.url,
+                repo_url=content.repository.html_url,
                 file_type=file_type,
                 parent_class=parent_class,
+                parent_function=parent_function,
                 namespace=namespace,
                 called_functions=called_functions,
                 imports=imports,
                 start_line=1,
                 end_line=file_content.count("\n") + 1,
+                updated_at=content.last_modified_datetime or datetime.now(timezone.utc),
             )
             chunks.append(chunk)
 
@@ -990,15 +1095,72 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
         self.include_files = include_files  # Initialize the new flag
         self.github_client: Github | None = None
         self.excluded_extensions = excluded_extensions or [
+            # Image formats
             ".jpg",
+            ".jpeg",
             ".png",
             ".gif",
+            ".bmp",
+            ".tiff",
+            ".ico",
+            ".webp",
+            ".svg",
+            # Video formats
             ".mp4",
+            ".avi",
+            ".mov",
+            ".wmv",
+            ".flv",
+            ".mkv",
+            ".webm",
+            # Audio formats
             ".mp3",
+            ".wav",
+            ".ogg",
+            ".flac",
+            ".aac",
+            # Archive formats
             ".zip",
             ".tar",
             ".gz",
+            ".rar",
+            ".7z",
+            ".bz2",
+            ".xz",
+            # Binary/executable formats
+            ".exe",
+            ".dll",
+            ".so",
+            ".dylib",
+            ".bin",
+            ".dat",
+            # Document formats (that aren't plain text)
             ".pdf",
+            ".doc",
+            ".docx",
+            ".ppt",
+            ".pptx",
+            ".xls",
+            ".xlsx",
+            # Database and large data files
+            ".db",
+            ".sqlite",
+            ".mdb",
+            ".accdb",
+            ".csv",
+            ".tsv",
+            # Font files
+            ".ttf",
+            ".otf",
+            ".woff",
+            ".woff2",
+            ".eot",
+            # Other binary formats
+            ".pyc",
+            ".pyd",
+            ".class",
+            ".o",
+            ".obj",
         ]
         self.excluded_directories = excluded_directories or [
             ".git",
@@ -1012,7 +1174,7 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
         self.max_workers = max_workers
 
         # Initialize chunker
-        tree_sitter_chunker = TreeSitterChunker()
+        tree_sitter_chunker = TreeSitterChunker(language_dir="./tree-sitter-grammars")
         self.code_chunker = RecursiveCodeChunker(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
@@ -1146,26 +1308,6 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
         documents = [chunk.to_document() for chunk in chunks]
 
         return documents
-        # headers = {
-        #     "Content-Type": "application/json",
-        #     #"Authorization": f"Bearer {self.onyx_api_key}",
-        # }
-
-        # try:
-        #     url = f"{self.onyx_api_url}/indexes/{self.index_name}/documents/batch"
-        #     response = requests.post(url, headers=headers, json=documents)
-
-        #     if response.status_code in (200, 201):
-        #         logger.info(f"Successfully indexed batch of {len(chunks)} chunks")
-        #         return len(chunks), 0
-        #     else:
-        #         logger.error(
-        #             f"Failed to index batch: {response.status_code} - {response.text}"
-        #         )
-        #         return 0, len(chunks)
-        # except Exception as e:
-        #     logger.error(f"Exception during batch indexing: {e}")
-        #     return 0, len(chunks)
 
     def process_content_into_documents(self, content: ContentFile) -> list[Document]:
         """
@@ -1675,12 +1817,19 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
                 )  # Fetch contents of the directory
 
                 checkpoint.curr_page += 1
-                done_with_contents = False
+
+                logger.info(
+                    f"Processing directory: {current_path}, stack size: {len(checkpoint.directory_stack)}"
+                )
+                logger.info(f"Found {len(contents)} items in directory")
+
                 for content in contents:
+                    # Skip files updated before the start date
                     if start is not None and content.last_modified_datetime < start:
-                        yield from doc_batch
-                        done_with_contents = True
-                        break
+                        # yield from doc_batch
+                        # done_with_contents = True
+                        # break
+                        continue
                     # Skip files updated after the end date
                     if end is not None and content.last_modified_datetime > end:
                         continue
@@ -1692,7 +1841,7 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
                         continue
                     else:
                         try:
-                            doc_batch.append(
+                            doc_batch.extend(
                                 self.process_content_into_documents(content)
                             )
                         except Exception as e:
@@ -1700,19 +1849,25 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
                             logger.exception(error_msg)
                             yield ConnectorFailure(
                                 failed_document=DocumentFailure(
-                                    document_id=str(issue.id),
-                                    document_link=issue.html_url,
+                                    document_id=str(content.name),
+                                    document_link=content.path,
                                 ),
                                 failure_message=error_msg,
                                 exception=e,
                             )
                             continue
 
-            # if we found any files on the current directory,
-            # yield them and return the checkpoint
-            if not done_with_contents and len(checkpoint.directory_stack) > 0:
+                # if we found any files on the current directory,
+                # yield them and return the checkpoint
+                if doc_batch and len(checkpoint.directory_stack) > 0:
+                    yield from doc_batch
+                    doc_batch = []  # Clear the batch after yielding
+                    # Only return checkpoint if we have items to process
+                    return checkpoint
+
+            # After the directory traversal loop ends
+            if doc_batch:  # If we have any remaining documents
                 yield from doc_batch
-                return checkpoint
 
             # if we went past the start date during the loop or there are no more
             # issues to get, we move on to the next repo
@@ -1864,24 +2019,6 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
             stage=GithubConnectorStage.PRS, curr_page=0, has_more=True
         )
 
-
-# if __name__ == "__main__":
-#     import time
-#     test_connector = GithubSourceConnector(
-#         repo_owner="philips-internal",
-#         repositories="clinical-platform",
-#     )
-#     test_connector.load_credentials(
-#         {"github_access_token": "os.environ["ACCESS_TOKEN_GITHUB"]"}
-#     )
-
-#     document_batches = test_connector.load_from_checkpoint(
-#         0, time.time(), test_connector.build_dummy_checkpoint()
-#     )
-
-#     current = time.time()
-#     one_day_ago = current - 24 * 60 * 60  # 1 day
-#     latest_docs = test_connector.poll_source(one_day_ago, current)
 
 if __name__ == "__main__":
     import os
