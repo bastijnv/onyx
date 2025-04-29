@@ -179,6 +179,8 @@ class CodeChunk:
     namespace: Optional[str] = None
     called_functions: list[str] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)
+    decorators: list[str] = field(default_factory=list)
+    jsx_elements: list[str] = field(default_factory=list)
     start_line: int = 0
     end_line: int = 0
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -187,9 +189,7 @@ class CodeChunk:
         """Convert the chunk to a document for indexing."""
         return Document(
             id=self.chunk_id,
-            sections=[
-                TextSection(link=self.repo_url + self.file_path, text=self.text or "")
-            ],
+            sections=[TextSection(link=self.repo_url, text=self.text or "")],
             source=DocumentSource.GITHUB_SOURCE,
             semantic_identifier=self.chunk_id,
             # updated_at is UTC time but is timezone unaware
@@ -204,6 +204,8 @@ class CodeChunk:
                 "namespace": self.namespace or "",
                 "called_functions": ",".join(self.called_functions) or "",
                 "imports": ",".join(self.imports) or "",
+                "decorators": ",".join(self.decorators) or "",
+                "jsx_elements": ",".join(self.jsx_elements) or "",
                 "start_line": str(self.start_line),
                 "end_line": str(self.end_line),
                 "source": "github",
@@ -414,7 +416,7 @@ class TreeSitterChunker:
             "functions": [],
             "called_functions": [],
             "decorators": [],
-            "namespaces": [],
+            "namespace": "",
             "jsx_elements": [],
         }
 
@@ -598,7 +600,7 @@ class TreeSitterChunker:
             "functions": [],
             "called_functions": [],
             "decorators": [],
-            "namespaces": [],
+            "namespace": "",
             "jsx_elements": [],
         }
 
@@ -622,7 +624,7 @@ class TreeSitterChunker:
                     elif capture == "jsx_element":
                         metadata["jsx_elements"].append(node.text.decode("utf-8"))
                     elif capture == "namespace_name":
-                        metadata["namespaces"].append(node.text.decode("utf-8"))
+                        metadata["namespace"] = node.text.decode("utf-8")
 
         except Exception as e:
             logger.warning(f"Error extracting metadata: {e}")
@@ -826,6 +828,9 @@ class RecursiveCodeChunker:
         parent_function = None
         called_functions = []
         imports = []
+        namespace = ""
+        decorators = []
+        jsx_elements = []
 
         if content.encoding != "base64":
             logger.warning(
@@ -846,34 +851,10 @@ class RecursiveCodeChunker:
                 parent_class = classes[0] if classes else None
                 parent_function = functions[0] if functions else None
                 called_functions = code_metadata.get("called_functions", [])
+                namespace = code_metadata.get("namespace", "")
+                decorators = code_metadata.get("decorators", [])
+                jsx_elements = code_metadata.get("jsx_elements", [])
 
-                # If namespace is explicitly provided in metadata
-                if "namespace" in code_metadata:
-                    namespace = code_metadata["namespace"]
-                # Try to extract namespace from imports or file structure
-                elif imports:
-                    # Simple heuristic: use the first import's package as namespace
-                    first_import = imports[0]
-                    if isinstance(first_import, str):
-                        match = re.search(
-                            r"import\s+([a-zA-Z0-9_.]+)|from\s+([a-zA-Z0-9_.]+)|package\s+([a-zA-Z0-9_.]+)|namespace\s+([a-zA-Z0-9_.]+)",
-                            first_import,
-                        )
-                        if match:
-                            # Take the first matching group that isn't None
-                            namespace = next(
-                                (g for g in match.groups() if g is not None), None
-                            )
-                            if namespace:
-                                namespace = namespace.split(".")[0]
-
-                if not namespace:
-                    # Use directory structure for namespace
-                    dir_parts = os.path.dirname(file_path).split(os.path.sep)
-                    if len(dir_parts) > 1 and dir_parts[-1]:
-                        namespace = dir_parts[-1]
-                    elif len(dir_parts) > 2:
-                        namespace = dir_parts[-2]
             except Exception as e:
                 logger.warning(f"Error extracting metadata from {file_path}: {e}")
 
@@ -903,7 +884,7 @@ class RecursiveCodeChunker:
                     file_path=file_path,
                     chunk_id=chunk_id,
                     repository=content.repository.name,
-                    repo_url=content.repository.html_url,  # Use html_url for browser URL
+                    repo_url=content.html_url,
                     file_type=file_type,
                     parent_class=parent_class,
                     parent_function=parent_function,
@@ -914,6 +895,8 @@ class RecursiveCodeChunker:
                     end_line=end_line,
                     updated_at=content.last_modified_datetime
                     or datetime.now(timezone.utc),
+                    decorators=decorators,
+                    jsx_elements=jsx_elements,
                 )
                 chunks.append(chunk)
 
