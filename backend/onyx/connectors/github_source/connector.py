@@ -1,10 +1,7 @@
-import concurrent.futures
 import copy
-import json
 import os
-import re
-import shutil
 import time
+from collections import Counter
 from collections.abc import Generator
 from dataclasses import dataclass
 from dataclasses import field
@@ -546,12 +543,17 @@ class TreeSitterChunker:
         ;; IMPORTS
         (import_statement (import_clause) @import)
 
-        ;; CLASSES
-        (class_declaration name: (type_identifier) @class_name)
+        ;; CLASSES - handle both identifier and type_identifier node types
+        (class_declaration name: (_) @class_name)
 
         ;; FUNCTIONS
         (method_definition name: (property_identifier) @function_name)
         (function_declaration name: (identifier) @function_name)
+        (arrow_function) @function_name
+        (variable_declaration
+        (variable_declarator
+            name: (_) @function_name
+            value: (arrow_function)))
 
         ;; CALLED FUNCTIONS
         (call_expression function: (identifier) @called_function)
@@ -606,25 +608,46 @@ class TreeSitterChunker:
 
         try:
             root_node = tree.root_node
-            parser_query = Query(tree.language, query)
-            captures = parser_query.captures(root_node)
 
-            for capture, nodes in captures.items():
-                for node in nodes:
-                    if capture == "import":
-                        metadata["imports"].append(node.text.decode("utf-8"))
-                    elif capture == "class_name":
-                        metadata["classes"].append(node.text.decode("utf-8"))
-                    elif capture == "function_name":
-                        metadata["functions"].append(node.text.decode("utf-8"))
-                    elif capture == "called_function":
-                        metadata["called_functions"].append(node.text.decode("utf-8"))
-                    elif capture == "decorator_name":
-                        metadata["decorators"].append(node.text.decode("utf-8"))
-                    elif capture == "jsx_element":
-                        metadata["jsx_elements"].append(node.text.decode("utf-8"))
-                    elif capture == "namespace_name":
-                        metadata["namespace"] = node.text.decode("utf-8")
+            # For debugging any specific parse issues
+            if root_node.has_error:
+                logger.debug("Tree has parsing errors but continuing with query")
+            try:
+                parser_query = Query(tree.language, query)
+                captures = parser_query.captures(root_node)
+
+                for capture, nodes in captures.items():
+                    try:
+                        for node in nodes:
+                            text = node.text.decode("utf-8")
+                            if capture == "import":
+                                metadata["imports"].append(text)
+                            elif capture == "class_name":
+                                metadata["classes"].append(text)
+                            elif capture == "function_name":
+                                metadata["functions"].append(text)
+                            elif capture == "called_function":
+                                metadata["called_functions"].append(text)
+                                # Store line number for function calls
+                                line_number = node.start_point[0] + 1
+                                if "function_locations" not in metadata:
+                                    metadata["function_locations"] = {}
+                                if text not in metadata["function_locations"]:
+                                    metadata["function_locations"][text] = []
+                                metadata["function_locations"][text].append(line_number)
+                            elif capture == "decorator_name":
+                                metadata["decorators"].append(text)
+                            elif capture == "jsx_element":
+                                metadata["jsx_elements"].append(text)
+                            elif capture == "namespace_name":
+                                metadata["namespace"] = text
+                    except Exception as node_err:
+                        logger.debug(f"Error processing node: {node_err}")
+                        continue
+
+            except Exception as query_err:
+                logger.warning(f"Query execution error: {query_err}")
+                # Continue with empty metadata rather than failing completely
 
         except Exception as e:
             logger.warning(f"Error extracting metadata: {e}")
@@ -809,13 +832,7 @@ class RecursiveCodeChunker:
 
     def chunk_content(self, content: ContentFile) -> list[CodeChunk]:
         """
-        Chunk a file recursively using the appropriate splitter.
-
-        Args:
-            content: Content of the file
-
-        Returns:
-            list of CodeChunk objects
+        Chunk a file recursively using the appropriate splitter with improved function call detection.
         """
         file_path = content.path
         _, ext = os.path.splitext(file_path)
@@ -832,67 +849,118 @@ class RecursiveCodeChunker:
         decorators = []
         jsx_elements = []
 
-        if content.encoding != "base64":
-            logger.warning(
-                f"File {file_path} is not base64 encoded. Skipping chunking."
-            )
-            return []
-
-        file_content = content.decoded_content.decode("utf-8")
-
-        if self.tree_sitter_chunker.has_parser(ext):
-            try:
-                code_metadata = self.tree_sitter_chunker.extract_metadata(
-                    file_content, file_path
+        try:
+            if content.encoding != "base64":
+                logger.warning(
+                    f"File {file_path} is not base64 encoded. Skipping chunking."
                 )
-                imports = code_metadata.get("imports", [])
-                classes = code_metadata.get("classes", [])
-                functions = code_metadata.get("functions", [])
-                parent_class = classes[0] if classes else None
-                parent_function = functions[0] if functions else None
-                called_functions = code_metadata.get("called_functions", [])
-                namespace = code_metadata.get("namespace", "")
-                decorators = code_metadata.get("decorators", [])
-                jsx_elements = code_metadata.get("jsx_elements", [])
+                return []
+
+            file_content = content.decoded_content.decode("utf-8")
+            code_metadata = {}
+
+            # Parse the full file with tree-sitter to extract metadata
+            if self.tree_sitter_chunker.has_parser(ext):
+                try:
+                    code_metadata = self.tree_sitter_chunker.extract_metadata(
+                        file_content, file_path
+                    )
+                    imports = code_metadata.get("imports", [])
+                    classes = code_metadata.get("classes", [])
+                    functions = code_metadata.get("functions", [])
+                    parent_class = classes[0] if classes else None
+                    parent_function = functions[0] if functions else None
+                    called_functions = code_metadata.get("called_functions", [])
+                    namespace = code_metadata.get("namespace", "")
+                    decorators = code_metadata.get("decorators", [])
+                    jsx_elements = code_metadata.get("jsx_elements", [])
+
+                    # Get function call locations directly from metadata
+                    function_call_locations = code_metadata.get(
+                        "function_locations", {}
+                    )
+                except Exception as e:
+                    logger.warning(f"Error extracting metadata from {file_path}: {e}")
+                    function_call_locations = {}
+            else:
+                function_call_locations = {}
+
+            # Chunk the text
+            chunks = []
+            try:
+                # Split the text into chunks
+                text_chunks = splitter.split_text(file_content)
+
+                # Create CodeChunk objects
+                for i, chunk_text in enumerate(text_chunks):
+                    # Create a unique chunk ID
+                    chunk_id = f"{content.repository.full_name}:{file_path}:{i}"
+
+                    # Extract line numbers for this chunk
+                    start_line = (
+                        file_content.count(
+                            "\n", 0, file_content.find(chunk_text.strip()[:50])
+                        )
+                        + 1
+                    )
+                    end_line = start_line + chunk_text.count("\n")
+
+                    # Find functions called specifically in this chunk's line range
+                    chunk_called_functions = set()
+                    for func_name, line_nums in function_call_locations.items():
+                        # Check if any instances of this function are called in the chunk's line range
+                        if any(
+                            start_line <= line_num <= end_line for line_num in line_nums
+                        ):
+                            chunk_called_functions.add(func_name)
+
+                    # Create chunk with chunk-specific called functions
+                    chunk = CodeChunk(
+                        text=chunk_text,
+                        file_path=file_path,
+                        chunk_id=chunk_id,
+                        repository=content.repository.name,
+                        repo_url=content.html_url,
+                        file_type=file_type,
+                        parent_class=parent_class,
+                        parent_function=parent_function,
+                        namespace=namespace,
+                        called_functions=list(
+                            chunk_called_functions
+                        ),  # Only functions called in this chunk
+                        imports=imports,
+                        start_line=start_line,
+                        end_line=end_line,
+                        updated_at=content.last_modified_datetime
+                        or datetime.now(timezone.utc),
+                        decorators=decorators,
+                        jsx_elements=jsx_elements,
+                    )
+                    chunks.append(chunk)
 
             except Exception as e:
-                logger.warning(f"Error extracting metadata from {file_path}: {e}")
-
-        # Chunk the text
-        chunks = []
-        try:
-            # Split the text into chunks
-            text_chunks = splitter.split_text(file_content)
-
-            # Create CodeChunk objects
-            for i, chunk_text in enumerate(text_chunks):
-                # Create a unique chunk ID
-                chunk_id = f"{content.repository.full_name}:{file_path}:{i}"
-
-                # Extract line numbers
-                start_line = (
-                    file_content.count(
-                        "\n", 0, file_content.find(chunk_text.strip()[:50])
-                    )
-                    + 1
-                )
-                end_line = start_line + chunk_text.count("\n")
-
-                # Create chunk
+                logger.error(f"Error chunking file {file_path}: {e}")
+                # Fall back to creating a single chunk with the entire file
+                chunk_id = f"{content.html_url}:0"
+                # For the fallback, use the simple set approach
+                # Create a set to remove duplicates and keep just up to 10 most relevant functions
+                # Get the 10 most frequently occurring functions
+                func_counter = Counter(called_functions)
+                unique_funcs = [func for func, _ in func_counter.most_common(10)]
                 chunk = CodeChunk(
-                    text=chunk_text,
+                    text=file_content,
                     file_path=file_path,
                     chunk_id=chunk_id,
                     repository=content.repository.name,
-                    repo_url=content.html_url,
+                    repo_url=content.repository.html_url,
                     file_type=file_type,
                     parent_class=parent_class,
                     parent_function=parent_function,
                     namespace=namespace,
-                    called_functions=called_functions,
+                    called_functions=unique_funcs,
                     imports=imports,
-                    start_line=start_line,
-                    end_line=end_line,
+                    start_line=1,
+                    end_line=file_content.count("\n") + 1,
                     updated_at=content.last_modified_datetime
                     or datetime.now(timezone.utc),
                     decorators=decorators,
@@ -900,141 +968,11 @@ class RecursiveCodeChunker:
                 )
                 chunks.append(chunk)
 
-        except Exception as e:
-            logger.error(f"Error chunking file {file_path}: {e}")
-            # If chunking fails, create a single chunk with the entire file
-            chunk_id = f"{content.repository.full_name}:{file_path}:0"
-            chunk = CodeChunk(
-                text=file_content,
-                file_path=file_path,
-                chunk_id=chunk_id,
-                repository=content.repository.name,
-                repo_url=content.repository.html_url,
-                file_type=file_type,
-                parent_class=parent_class,
-                parent_function=parent_function,
-                namespace=namespace,
-                called_functions=called_functions,
-                imports=imports,
-                start_line=1,
-                end_line=file_content.count("\n") + 1,
-                updated_at=content.last_modified_datetime or datetime.now(timezone.utc),
-            )
-            chunks.append(chunk)
-
-        return chunks
-
-    def chunk_file(
-        self, file_path: str, file_content: str, repo_name: str, repo_url: str
-    ) -> list[CodeChunk]:
-        """
-        Chunk a file recursively using the appropriate splitter.
-
-        Args:
-            file_path: Path to the file
-            file_content: Content of the file
-            repo_name: Name of the repository
-            repo_url: URL of the repository
-
-        Returns:
-            list of CodeChunk objects
-        """
-        _, ext = os.path.splitext(file_path)
-        file_type = ext.lstrip(".")
-        splitter = self.get_splitter_for_file(file_path)
-
-        # Extract code metadata if possible
-        namespace = None
-        parent_class = None
-        called_functions = []
-        imports = []
-
-        if self.tree_sitter_chunker.has_parser(ext):
-            try:
-                code_metadata = self.tree_sitter_chunker.extract_metadata(
-                    file_content, file_path
-                )
-                imports = code_metadata.get("imports", [])
-                classes = code_metadata.get("classes", [])
-                parent_class = classes[0] if classes else None
-                called_functions = code_metadata.get("called_functions", [])
-
-                # Try to extract namespace from imports or file structure
-                if imports:
-                    # Simple heuristic: use the first import's package as namespace
-                    first_import = imports[0]
-                    match = re.search(r"import\s+([a-zA-Z0-9_.]+)", first_import)
-                    if match:
-                        namespace = match.group(1).split(".")[0]
-
-                if not namespace:
-                    # Use directory structure for namespace
-                    dir_parts = os.path.dirname(file_path).split(os.path.sep)
-                    if len(dir_parts) > 1 and dir_parts[-1]:
-                        namespace = dir_parts[-1]
-                    elif len(dir_parts) > 2:
-                        namespace = dir_parts[-2]
-            except Exception as e:
-                logger.warning(f"Error extracting metadata from {file_path}: {e}")
-
-        # Chunk the text
-        chunks = []
-        try:
-            # Split the text into chunks
-            text_chunks = splitter.split_text(file_content)
-
-            # Create CodeChunk objects
-            for i, chunk_text in enumerate(text_chunks):
-                # Create a unique chunk ID
-                chunk_id = f"{repo_name}:{file_path}:{i}"
-
-                # Extract line numbers
-                start_line = (
-                    file_content.count(
-                        "\n", 0, file_content.find(chunk_text.strip()[:50])
-                    )
-                    + 1
-                )
-                end_line = start_line + chunk_text.count("\n")
-
-                # Create chunk
-                chunk = CodeChunk(
-                    text=chunk_text,
-                    file_path=file_path,
-                    chunk_id=chunk_id,
-                    repository=repo_name,
-                    repo_url=repo_url,
-                    file_type=file_type,
-                    parent_class=parent_class,
-                    namespace=namespace,
-                    called_functions=called_functions,
-                    imports=imports,
-                    start_line=start_line,
-                    end_line=end_line,
-                )
-                chunks.append(chunk)
+            return chunks
 
         except Exception as e:
-            logger.error(f"Error chunking file {file_path}: {e}")
-            # If chunking fails, create a single chunk with the entire file
-            chunk_id = f"{repo_name}:{file_path}:0"
-            chunk = CodeChunk(
-                text=file_content,
-                file_path=file_path,
-                chunk_id=chunk_id,
-                repository=repo_name,
-                repo_url=repo_url,
-                file_type=file_type,
-                parent_class=parent_class,
-                namespace=namespace,
-                called_functions=called_functions,
-                imports=imports,
-                start_line=1,
-                end_line=file_content.count("\n") + 1,
-            )
-            chunks.append(chunk)
-
-        return chunks
+            logger.warning(f"Error processing file {file_path}: {e}")
+            return []  # Return empty list instead of failing
 
 
 class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
@@ -1164,36 +1102,6 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
             tree_sitter_chunker=tree_sitter_chunker,
         )
 
-    def clone_repository(self, repo_url: str, branch: str = "main") -> str:
-        """
-        Clone a GitHub repository to a temporary directory.
-
-        Args:
-            repo_url: URL of the GitHub repository
-            branch: Branch name to clone (default: main)
-
-        Returns:
-            Path to the cloned repository
-        """
-        logger.info("#######clone_repository commented out########")
-        # temp_dir = tempfile.mkdtemp()
-        # logger.info(f"Cloning repository {repo_url} to {temp_dir}")
-
-        # clone_url = repo_url
-        # if self.github_token and 'github.com' in repo_url:
-        #     # Insert token for authentication if it's a GitHub repo
-        #     if repo_url.startswith('https://'):
-        #         clone_url = repo_url.replace('https://', f'https://{self.github_token}@')
-
-        # try:
-        #     Repo.clone_from(clone_url, temp_dir, branch=branch)
-        #     logger.info(f"Successfully cloned repository to {temp_dir}")
-        #     return temp_dir
-        # except GitCommandError as e:
-        #     logger.error(f"Failed to clone repository: {e}")
-        #     shutil.rmtree(temp_dir, ignore_errors=True)
-        #     raise
-
     def should_process_file(self, file_path: str) -> bool:
         """
         Determine if a file should be processed based on exclusion rules.
@@ -1213,6 +1121,60 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
         parts = file_path.split(os.path.sep)
         for part in parts:
             if part in self.excluded_directories:
+                return False
+
+        # Check for specific files to ignore
+        filename = os.path.basename(file_path)
+        ignored_filenames = ["package-lock.json"]
+        if filename in ignored_filenames:
+            return False
+
+        # Check for generated, build output, and other binary files
+        ignored_patterns = [
+            # Build output directories often found at file level
+            "bin/",
+            "obj/",
+            "dist/",
+            "out/",
+            # VS and .NET specific files
+            ".csproj.user",
+            ".suo",
+            ".vssscc",
+            ".vspscc",
+            ".vs/",
+            ".vscode/",
+            "*.lock.json",
+            "launchSettings.json",
+            # Build artifacts
+            "*.min.js",
+            "*.min.css",
+            "*.bundle.js",
+            # Generated TypeScript files
+            ".d.ts",
+            "*.js.map",
+            "*.d.ts.map",
+            # PowerShell build files
+            "*.ps1xml",
+            "*.psd1",
+            "*.psm1.signature",
+            # Test files that might contain large mocks
+            "**/TestResults/**",
+            "**/coverage/**",
+            "*.coverage",
+            # NuGet packages
+            "packages.config",
+            "project.assets.json",
+            # MSBuild files
+            "*.nuget.targets",
+            "*.nuget.props",
+        ]
+
+        for pattern in ignored_patterns:
+            if pattern.startswith("*") and pattern[1:] in file_path:
+                return False
+            elif pattern.endswith("/") and pattern[:-1] in file_path.split(os.path.sep):
+                return False
+            elif pattern in file_path:
                 return False
 
         return True
@@ -1242,39 +1204,6 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
             logger.warning(f"Failed to read file {file_path}: {e}")
             return None
 
-    def index_chunk(self, chunk: CodeChunk) -> bool:
-        """
-        Index a single code chunk into Onyx.
-
-        Args:
-            chunk: CodeChunk object to index
-
-        Returns:
-            Boolean indicating if indexing was successful
-        """
-        chunk.to_document()
-
-        # headers = {
-        #     "Content-Type": "application/json",
-        #     "Authorization": f"Bearer {self.onyx_api_key}",
-        # }
-
-        # try:
-        #     url = f"{self.onyx_api_url}/indexes/{self.index_name}/documents"
-        #     response = requests.post(url, headers=headers, json=document)
-
-        #     if response.status_code in (200, 201):
-        #         logger.debug(f"Successfully indexed {chunk.chunk_id}")
-        #         return True
-        #     else:
-        #         logger.error(
-        #             f"Failed to index {chunk.chunk_id}: {response.status_code} - {response.text}"
-        #         )
-        #         return False
-        # except Exception as e:
-        #     logger.error(f"Exception during indexing of {chunk.chunk_id}: {e}")
-        #     return False
-
     def index_chunks_batch(self, chunks: list[CodeChunk]) -> list[Document]:
         """
         Index a batch of code chunks into Onyx.
@@ -1286,7 +1215,7 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
             Tuple of (chunks indexed, failures)
         """
         if not chunks:
-            return 0, 0
+            return []
 
         documents = [chunk.to_document() for chunk in chunks]
 
@@ -1323,209 +1252,6 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
         # stats["status"] = "success" if failures == 0 else "partial_failure"
 
         return documents
-
-    def process_file(
-        self, file_path: str, repo_name: str, repo_url: str
-    ) -> dict[str, Any]:
-        """
-        Process a single file and index its chunks.
-
-        Args:
-            file_path: Path to the file
-            repo_name: Name of the repository
-            repo_url: URL of the repository
-
-        Returns:
-            Statistics about the processing
-        """
-        stats = {
-            "file": os.path.basename(file_path),
-            "chunks_created": 0,
-            "chunks_indexed": 0,
-            "errors": 0,
-        }
-
-        if not self.should_process_file(file_path):
-            stats["status"] = "skipped"
-            return stats
-
-        content = self.read_file_content(file_path)
-        if content is None:
-            stats["status"] = "error"
-            stats["errors"] = 1
-            return stats
-
-        # Skip empty files
-        if not content.strip():
-            stats["status"] = "empty"
-            return stats
-
-        # Chunk the file
-        chunks = self.code_chunker.chunk_file(file_path, content, repo_name, repo_url)
-        stats["chunks_created"] = len(chunks)
-
-        # Index the chunks
-        documents = self.index_chunks_batch(chunks)
-        stats["chunks_indexed"] = len(documents)
-        # stats["errors"] = failures
-        # stats["status"] = "success" if failures == 0 else "partial_failure"
-
-        return stats
-
-    def process_directory(
-        self, dir_path: str, repo_name: str, repo_url: str
-    ) -> dict[str, Any]:
-        """
-        Process a directory recursively and index all valid files.
-
-        Args:
-            dir_path: Path to the directory
-            repo_name: Name of the repository
-            repo_url: URL of the repository
-
-        Returns:
-            Statistics about the processing
-        """
-        stats = {
-            "files_processed": 0,
-            "files_skipped": 0,
-            "chunks_created": 0,
-            "chunks_indexed": 0,
-            "errors": 0,
-            "file_stats": {},
-        }
-
-        file_paths = []
-
-        # Collect all files
-        for root, dirs, files in os.walk(dir_path):
-            # Filter out excluded directories
-            for excluded_dir in self.excluded_directories:
-                if excluded_dir in dirs:
-                    dirs.remove(excluded_dir)
-
-            for file in files:
-                file_path = os.path.join(root, file)
-                if self.should_process_file(file_path):
-                    file_paths.append(file_path)
-                else:
-                    stats["files_skipped"] += 1
-
-        logger.info(f"Found {len(file_paths)} files to process in {repo_name}")
-
-        # Process files in parallel
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.max_workers
-        ) as executor:
-            future_to_file = {
-                executor.submit(
-                    self.process_file, file_path, repo_name, repo_url
-                ): file_path
-                for file_path in file_paths
-            }
-
-            for future in concurrent.futures.as_completed(future_to_file):
-                file_path = future_to_file[future]
-                try:
-                    file_stats = future.result()
-                    stats["files_processed"] += 1
-                    stats["chunks_created"] += file_stats["chunks_created"]
-                    stats["chunks_indexed"] += file_stats["chunks_indexed"]
-                    stats["errors"] += file_stats["errors"]
-
-                    # Store individual file stats
-                    rel_path = os.path.relpath(file_path, dir_path)
-                    stats["file_stats"][rel_path] = file_stats
-
-                    if stats["files_processed"] % 50 == 0:
-                        logger.info(
-                            f"Processed {stats['files_processed']} files so far..."
-                        )
-
-                except Exception as e:
-                    logger.error(f"Error processing file {file_path}: {e}")
-                    stats["errors"] += 1
-                    rel_path = os.path.relpath(file_path, dir_path)
-                    stats["file_stats"][rel_path] = {
-                        "status": "error",
-                        "errors": 1,
-                        "chunks_created": 0,
-                        "chunks_indexed": 0,
-                    }
-
-        return stats
-
-    def ingest_repository(self, repo_url: str, branch: str = "main") -> dict[str, Any]:
-        """
-        Ingest a GitHub repository into the Onyx index.
-
-        Args:
-            repo_url: URL of the GitHub repository
-            branch: Branch name to ingest (default: main)
-
-        Returns:
-            Statistics about the ingestion process
-        """
-        # Extract repo name from URL
-        repo_name = repo_url.rstrip("/").split("/")[-1]
-        if repo_name.endswith(".git"):
-            repo_name = repo_name[:-4]
-
-        # Clone the repository
-        temp_dir = None
-        try:
-            temp_dir = self.clone_repository(repo_url, branch)
-
-            # Process the repository
-            stats = self.process_directory(temp_dir, repo_name, repo_url)
-            stats["repository"] = repo_name
-            stats["branch"] = branch
-
-            logger.info(
-                f"""Repository {repo_name} processing completed:
-                {json.dumps({k: v for k, v in stats.items() if k != 'file_stats'})}"""
-            )
-            return stats
-
-        finally:
-            # Clean up temporary directory
-            if temp_dir and os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                logger.info(f"Cleaned up temporary directory {temp_dir}")
-
-    def ingest_repositories(
-        self, repo_list: list[dict[str, str]]
-    ) -> list[dict[str, Any]]:
-        """
-        Ingest multiple GitHub repositories into the Onyx index.
-
-        Args:
-            repo_list: list of dictionaries with 'url' and optional 'branch' keys
-
-        Returns:
-            list of statistics for each repository
-        """
-        results = []
-
-        for repo_info in repo_list:
-            repo_url = repo_info["url"]
-            branch = repo_info.get("branch", "main")
-
-            try:
-                stats = self.ingest_repository(repo_url, branch)
-                results.append(stats)
-            except Exception as e:
-                logger.error(f"Failed to ingest repository {repo_url}: {e}")
-                results.append(
-                    {
-                        "repository": repo_url.rstrip("/").split("/")[-1],
-                        "branch": branch,
-                        "error": str(e),
-                        "status": "failed",
-                    }
-                )
-
-        return results
 
     def load_credentials(self, credentials: dict[str, Any]) -> dict[str, Any] | None:
         # defaults to 30 items per page, can be set to as high as 100
@@ -1791,66 +1517,61 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
             ):
                 checkpoint.directory_stack = [""]
 
-            while checkpoint.directory_stack:
-                current_path = (
-                    checkpoint.directory_stack.pop()
-                )  # Get the current directory path
-                contents = repo.get_contents(
-                    current_path
-                )  # Fetch contents of the directory
+            current_path = (
+                checkpoint.directory_stack.pop()
+            )  # Get the current directory path
+            contents = repo.get_contents(
+                current_path
+            )  # Fetch contents of the directory
 
-                checkpoint.curr_page += 1
+            checkpoint.curr_page += 1
 
-                logger.info(
-                    f"Processing directory: {current_path}, stack size: {len(checkpoint.directory_stack)}"
-                )
-                logger.info(f"Found {len(contents)} items in directory")
+            logger.info(
+                f"Processing directory: {current_path}, stack size: {len(checkpoint.directory_stack)}"
+            )
+            logger.info(f"Current directory stack: {checkpoint.directory_stack}")
+            logger.info(f"Found {len(contents)} items in {current_path}")
 
-                for content in contents:
-                    # Skip files updated before the start date
-                    if start is not None and content.last_modified_datetime < start:
-                        # yield from doc_batch
-                        # done_with_contents = True
-                        # break
+            for content in contents:
+                # Skip files updated before the start date
+                # if start is not None and content.last_modified_datetime < start:
+                #     #yield from doc_batch
+                #     #done_with_contents = True
+                #     #break
+                #     continue
+                # # Skip files updated after the end date
+                # if end is not None and content.last_modified_datetime > end:
+                #     continue
+
+                if content.type == "dir":
+                    # Add the directory's path to the stack
+                    checkpoint.directory_stack.append(content.path)
+                elif self.should_process_file(content.path) is False:
+                    logger.info(f"Skipping file {content.path} due to exclusion rules.")
+                    continue
+                else:
+                    try:
+                        doc_batch.extend(self.process_content_into_documents(content))
+                    except Exception as e:
+                        error_msg = f"Error converting content to document: {e}"
+                        logger.exception(error_msg)
+                        yield ConnectorFailure(
+                            failed_document=DocumentFailure(
+                                document_id=str(content.name),
+                                document_link=content.path,
+                            ),
+                            failure_message=error_msg,
+                            exception=e,
+                        )
                         continue
-                    # Skip files updated after the end date
-                    if end is not None and content.last_modified_datetime > end:
-                        continue
 
-                    if content.type == "dir":
-                        # Add the directory's path to the stack
-                        checkpoint.directory_stack.append(content.path)
-                    elif self.should_process_file(content.path) is False:
-                        continue
-                    else:
-                        try:
-                            doc_batch.extend(
-                                self.process_content_into_documents(content)
-                            )
-                        except Exception as e:
-                            error_msg = f"Error converting content to document: {e}"
-                            logger.exception(error_msg)
-                            yield ConnectorFailure(
-                                failed_document=DocumentFailure(
-                                    document_id=str(content.name),
-                                    document_link=content.path,
-                                ),
-                                failure_message=error_msg,
-                                exception=e,
-                            )
-                            continue
-
-                # if we found any files on the current directory,
-                # yield them and return the checkpoint
-                if doc_batch and len(checkpoint.directory_stack) > 0:
-                    yield from doc_batch
-                    doc_batch = []  # Clear the batch after yielding
-                    # Only return checkpoint if we have items to process
-                    return checkpoint
-
-            # After the directory traversal loop ends
-            if doc_batch:  # If we have any remaining documents
-                yield from doc_batch
+            # Whether we have files to yield or not, return the checkpoint
+            # if we still have directories to process
+            yield from doc_batch
+            if len(checkpoint.directory_stack) > 0:
+                # Return checkpoint if we have more directories to process
+                # regardless of whether current directory had files
+                return checkpoint
 
             # if we went past the start date during the loop or there are no more
             # issues to get, we move on to the next repo
