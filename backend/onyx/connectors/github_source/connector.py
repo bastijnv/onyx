@@ -1,7 +1,6 @@
 import copy
 import os
 import time
-from collections import Counter
 from collections.abc import Generator
 from dataclasses import dataclass
 from dataclasses import field
@@ -26,6 +25,7 @@ from github.Requester import Requester
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 from tree_sitter import Language
+from tree_sitter import Parser
 from tree_sitter import Query
 from typing_extensions import override
 
@@ -155,11 +155,6 @@ class GithubConnectorCheckpoint(ConnectorCheckpoint):
     cached_repo_ids: list[int] | None = None
     cached_repo: SerializedRepository | None = None
 
-    # This is a workaround to allow arbitrary types in the model
-    # TODO: Remove this once we have a better solution
-    # class Config:
-    #     arbitrary_types_allowed = True
-
 
 @dataclass
 class CodeChunk:
@@ -173,38 +168,75 @@ class CodeChunk:
     file_type: str
     parent_class: Optional[str] = None
     parent_function: Optional[str] = None
-    namespace: Optional[str] = None
-    called_functions: list[str] = field(default_factory=list)
-    imports: list[str] = field(default_factory=list)
-    decorators: list[str] = field(default_factory=list)
-    jsx_elements: list[str] = field(default_factory=list)
     start_line: int = 0
     end_line: int = 0
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
+    # Common metadata fields
+    variable: list[str] = field(default_factory=list)
+    variable_member: list[str] = field(default_factory=list)
+    variable_parameter: list[str] = field(default_factory=list)
+    variable_builtin: list[str] = field(default_factory=list)
+
+    function_method: list[str] = field(default_factory=list)
+    function_method_call: list[str] = field(default_factory=list)
+
+    _type: list[str] = field(default_factory=list)
+    type_builtin: list[str] = field(default_factory=list)
+    type_definition: list[str] = field(default_factory=list)
+
+    module: list[str] = field(default_factory=list)
+    namespace: list[str] = field(default_factory=list)
+    constant: list[str] = field(default_factory=list)
+    constant_macro: list[str] = field(default_factory=list)
+    constant_builtin: list[str] = field(default_factory=list)
+
+    keyword: list[str] = field(default_factory=list)
+    keyword_conditional: list[str] = field(default_factory=list)
+    keyword_repeat: list[str] = field(default_factory=list)
+    keyword_return: list[str] = field(default_factory=list)
+    keyword_operator: list[str] = field(default_factory=list)
+    keyword_import: list[str] = field(default_factory=list)
+    keyword_modifier: list[str] = field(default_factory=list)
+    keyword_directive: list[str] = field(default_factory=list)
+    keyword_exception: list[str] = field(default_factory=list)
+
+    attribute: list[str] = field(default_factory=list)
+    attribute_builtin: list[str] = field(default_factory=list)
+
+    label: list[str] = field(default_factory=list)
+    operator: list[str] = field(default_factory=list)
+    _property: list[str] = field(default_factory=list)
+    constructor: list[str] = field(default_factory=list)
+
     def to_document(self) -> Document:
         """Convert the chunk to a document for indexing."""
+        # Set maximum lengths for metadata fields
+        MAX_TAG_LENGTH = 255
+
+        # Truncate string values
+        def truncate_str(value: str) -> str:
+            if not value:
+                return ""
+            if len(value) > MAX_TAG_LENGTH:
+                return value[: MAX_TAG_LENGTH - 3] + "..."
+            return value
+
         return Document(
             id=self.chunk_id,
             sections=[TextSection(link=self.repo_url, text=self.text or "")],
             source=DocumentSource.GITHUB_SOURCE,
             semantic_identifier=self.chunk_id,
-            # updated_at is UTC time but is timezone unaware
             doc_updated_at=self.updated_at.replace(tzinfo=timezone.utc),
             metadata={
-                "repository": self.repository,
-                "repo_url": self.repo_url,
-                "file_path": self.file_path,
-                "file_type": self.file_type,
-                "parent_class": self.parent_class or "",
-                "parent_function": self.parent_function or "",
-                "namespace": self.namespace or "",
-                "called_functions": ",".join(self.called_functions) or "",
-                "imports": ",".join(self.imports) or "",
-                "decorators": ",".join(self.decorators) or "",
-                "jsx_elements": ",".join(self.jsx_elements) or "",
+                "repository": truncate_str(self.repository),
+                "repo_url": truncate_str(self.repo_url),
+                "file_path": truncate_str(self.file_path),
+                "file_type": truncate_str(self.file_type),
                 "start_line": str(self.start_line),
                 "end_line": str(self.end_line),
+                "parent_class": truncate_str(self.parent_class or ""),
+                "parent_function": truncate_str(self.parent_function or ""),
                 "source": "github",
             },
         )
@@ -213,7 +245,7 @@ class CodeChunk:
 class TreeSitterChunker:
     """Handle code parsing using tree-sitter for better code understanding."""
 
-    def __init__(self, language_dir: str = "./tree-sitter-grammars"):
+    def __init__(self, query_dir: str = "./queries"):
         """
         Initialize the TreeSitterChunker.
 
@@ -221,20 +253,20 @@ class TreeSitterChunker:
             language_dir: Directory containing compiled tree-sitter language libraries
         """
         # Convert relative path to absolute path
-        if not os.path.isabs(language_dir):
+        if not os.path.isabs(query_dir):
             # Get the directory where the connector script is located
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            language_dir = os.path.abspath(os.path.join(current_dir, language_dir))
+            query_dir = os.path.abspath(os.path.join(current_dir, query_dir))
 
-        self.language_dir = language_dir
-        self.parsers = {}
+        self.parsers: dict[str, Parser] = {}
+        self.query_dir = query_dir
 
         # Debugging: Log the absolute path
-        logger.info(f"Tree-sitter language directory path: {self.language_dir}")
+        logger.info(f"Tree-sitter queries directory path: {self.query_dir}")
 
         self._init_parsers()
 
-    def _init_parsers(self):
+    def _init_parsers(self) -> None:
         """Initialize parsers for supported languages."""
         try:
             from tree_sitter import Parser
@@ -394,6 +426,23 @@ class TreeSitterChunker:
         """Check if a parser exists for the given file extension."""
         return file_ext in self.parsers
 
+    def _load_query(self, query_name: str) -> str:
+        """
+        Load a query from a `.scm` file.
+
+        Args:
+            query_name: Name of the query file (without extension)
+
+        Returns:
+            The query text as a string.
+        """
+        query_path = os.path.join(self.query_dir, f"{query_name}.scm")
+        if not os.path.exists(query_path):
+            raise FileNotFoundError(f"Query file not found: {query_path}")
+
+        with open(query_path, "r", encoding="utf-8") as f:
+            return f.read()
+
     def extract_metadata(self, code: str, file_path: str) -> dict[str, Any]:
         """
         Extract metadata from code using tree-sitter.
@@ -407,14 +456,40 @@ class TreeSitterChunker:
         """
         _, ext = os.path.splitext(file_path)
 
-        metadata = {
-            "imports": [],
-            "classes": [],
-            "functions": [],
-            "called_functions": [],
-            "decorators": [],
-            "namespace": "",
-            "jsx_elements": [],
+        metadata: dict[str, list[str]] = {
+            # Common metadata fields
+            "variable": [],  # Basic variables
+            "variable.member": [],  # Member variables/properties
+            "variable.parameter": [],  # Function parameters
+            "variable.builtin": [],  # Built-in variables like this, base
+            "function.method": [],  # Method definitions
+            "function.method.call": [],  # Method calls
+            "type": [],  # Types/classes references
+            "type.builtin": [],  # Built-in types
+            "type.definition": [],  # Type definitions
+            "module": [],  # Modules/namespaces
+            "constant": [],  # Constants
+            "constant.macro": [],  # Macro constants
+            "constant.builtin": [],  # Built-in constants
+            "keyword": [],  # General keywords
+            "keyword.conditional": [],  # if/else/switch
+            "keyword.repeat": [],  # loops
+            "keyword.return": [],  # return statements
+            "keyword.operator": [],  # operator keywords
+            "keyword.import": [],  # import/using keywords
+            "keyword.modifier": [],  # access modifiers
+            "keyword.directive": [],  # preprocessor directives
+            "keyword.exception": [],  # try/catch/throw
+            "keyword.type": [],  # type keywords
+            "keyword.conditional.ternary": [],  # Ternary conditional operator
+            "attribute": [],  # Attributes/decorators
+            "attribute.builtin": [],  # Built-in attributes
+            # Other metadata
+            "label": [],  # Code labels for goto
+            "operator": [],  # Operators
+            "property": [],  # Properties
+            "constructor": [],  # Constructors
+            "namespace": [],  # Current namespace
         }
 
         if ext not in self.parsers:
@@ -429,10 +504,10 @@ class TreeSitterChunker:
                 metadata = self._extract_csharp_metadata(tree)
             elif ext == ".py":
                 metadata = self._extract_python_metadata(tree)
-            elif ext in (".ts", ".js"):
-                metadata = self._extract_js_ts_metadata(tree)
-            elif ext in (".tsx", ".jsx"):
-                metadata = self._extract_tsx_jsx_metadata(tree)
+            elif ext in (".ts", ".tsx"):
+                metadata = self._extract_ts_tsx_metadata(tree)
+            elif ext in (".js", ".jsx"):
+                metadata = self._extract_js_jsx_metadata(tree)
             elif ext in (".c"):
                 metadata = self._extract_c_metadata(tree)
             elif ext in (".cpp", ".hpp"):
@@ -460,131 +535,25 @@ class TreeSitterChunker:
         return metadata
 
     def _extract_c_metadata(self, tree: tree_sitter.Tree) -> dict[str, Any]:
-        query = """
-        (preproc_include
-            (string) @import)
-
-        (function_definition
-            declarator: (function_declarator
-                declarator: (identifier) @function_name))
-
-        (call_expression
-            function: (identifier) @called_function)
-        """
-        return self._extract_metadata_with_query(tree, query)
+        return self._extract_metadata_with_query(tree, "c_query")
 
     def _extract_cpp_metadata(self, tree: tree_sitter.Tree) -> dict[str, Any]:
-        query = """
-        (preproc_include
-            (string) @import)
-
-        (namespace_definition
-            name: (identifier) @namespace_name)
-
-        (class_specifier
-            name: (type_identifier) @class_name)
-
-        (function_definition
-            declarator: (function_declarator
-                declarator: (identifier) @function_name))
-
-        (call_expression
-            function: (identifier) @called_function)
-        """
-        return self._extract_metadata_with_query(tree, query)
+        return self._extract_metadata_with_query(tree, "cpp_query")
 
     def _extract_python_metadata(self, tree: tree_sitter.Tree) -> dict[str, Any]:
-        query = """
-        (import_statement
-            name: (dotted_name (identifier) @import))
+        return self._extract_metadata_with_query(tree, "python_query")
 
-        (import_from_statement
-            module_name: (dotted_name (identifier) @import))
+    def _extract_ts_tsx_metadata(self, tree: tree_sitter.Tree) -> dict[str, Any]:
+        return self._extract_metadata_with_query(tree, "typescript_query")
 
-        (class_definition
-            name: (identifier) @class_name)
-
-        (function_definition
-            name: (identifier) @function_name)
-
-        (call
-            function: (identifier) @called_function)
-        """
-        return self._extract_metadata_with_query(tree, query)
-
-    def _extract_tsx_jsx_metadata(self, tree: tree_sitter.Tree) -> dict[str, Any]:
-        query = """
-        ;; IMPORTS
-        (import_statement (import_clause) @import)
-
-        ;; CLASSES
-        (class_declaration name: (type_identifier) @class_name)
-
-        ;; FUNCTIONS
-        (method_definition name: (property_identifier) @function_name)
-        (function_declaration name: (identifier) @function_name)
-        (lexical_declaration
-        (variable_declarator
-            name: (identifier) @function_name
-            value: (arrow_function)))
-
-        ;; FUNCTION CALLS
-        (call_expression function: (identifier) @called_function)
-        (call_expression function: (member_expression property: (property_identifier) @called_function))
-
-        ;; JSX ELEMENTS
-        (jsx_opening_element name: (identifier) @jsx_element)
-        (jsx_self_closing_element name: (identifier) @jsx_element)
-        """
-        return self._extract_metadata_with_query(tree, query)
-
-    def _extract_js_ts_metadata(self, tree: tree_sitter.Tree) -> dict[str, Any]:
-        query = """
-        ;; IMPORTS
-        (import_statement (import_clause) @import)
-
-        ;; CLASSES - handle both identifier and type_identifier node types
-        (class_declaration name: (_) @class_name)
-
-        ;; FUNCTIONS
-        (method_definition name: (property_identifier) @function_name)
-        (function_declaration name: (identifier) @function_name)
-        (arrow_function) @function_name
-        (variable_declaration
-        (variable_declarator
-            name: (_) @function_name
-            value: (arrow_function)))
-
-        ;; CALLED FUNCTIONS
-        (call_expression function: (identifier) @called_function)
-        (call_expression function: (member_expression property: (property_identifier) @called_function))
-
-        ;; DECORATORS (Angular-specific)
-        (decorator (call_expression function: (identifier) @decorator_name))
-        """
-        return self._extract_metadata_with_query(tree, query)
+    def _extract_js_jsx_metadata(self, tree: tree_sitter.Tree) -> dict[str, Any]:
+        return self._extract_metadata_with_query(tree, "javascript_query")
 
     def _extract_csharp_metadata(self, tree: tree_sitter.Tree) -> dict[str, Any]:
-        query = """
-        (using_directive
-        (identifier) @import)
-
-        (namespace_declaration
-            name: (identifier) @namespace_name)
-
-        (class_declaration
-            name: (identifier) @class_name)
-
-        (method_declaration
-            name: (identifier) @function_name)
-
-        (invocation_expression
-            function: (identifier) @called_function)
-        """
-        return self._extract_metadata_with_query(tree, query)
+        return self._extract_metadata_with_query(tree, "c_sharp_query")
 
     def _extract_metadata_with_query(
-        self, tree: tree_sitter.Tree, query: str
+        self, tree: tree_sitter.Tree, query_name: str
     ) -> dict[str, Any]:
         """
         Extract metadata from code using a tree-sitter query.
@@ -596,14 +565,40 @@ class TreeSitterChunker:
         Returns:
             A dictionary containing extracted metadata.
         """
-        metadata = {
-            "imports": [],
-            "classes": [],
-            "functions": [],
-            "called_functions": [],
-            "decorators": [],
-            "namespace": "",
-            "jsx_elements": [],
+        metadata: dict[str, list[str]] = {
+            # Common metadata fields
+            "variable": [],  # Basic variables
+            "variable.member": [],  # Member variables/properties
+            "variable.parameter": [],  # Function parameters
+            "variable.builtin": [],  # Built-in variables like this, base
+            "function.method": [],  # Method definitions
+            "function.method.call": [],  # Method calls
+            "type": [],  # Types/classes references
+            "type.builtin": [],  # Built-in types
+            "type.definition": [],  # Type definitions
+            "module": [],  # Modules/namespaces
+            "constant": [],  # Constants
+            "constant.macro": [],  # Macro constants
+            "constant.builtin": [],  # Built-in constants
+            "keyword": [],  # General keywords
+            "keyword.conditional": [],  # if/else/switch
+            "keyword.repeat": [],  # loops
+            "keyword.return": [],  # return statements
+            "keyword.operator": [],  # operator keywords
+            "keyword.import": [],  # import/using keywords
+            "keyword.modifier": [],  # access modifiers
+            "keyword.directive": [],  # preprocessor directives
+            "keyword.exception": [],  # try/catch/throw
+            "keyword.type": [],  # type keywords
+            "keyword.conditional.ternary": [],  # Ternary conditional operator
+            "attribute": [],  # Attributes/decorators
+            "attribute.builtin": [],  # Built-in attributes
+            # Other metadata
+            "label": [],  # Code labels for goto
+            "operator": [],  # Operators
+            "property": [],  # Properties
+            "constructor": [],  # Constructors
+            "namespace": [],  # Current namespace
         }
 
         try:
@@ -613,34 +608,66 @@ class TreeSitterChunker:
             if root_node.has_error:
                 logger.debug("Tree has parsing errors but continuing with query")
             try:
-                parser_query = Query(tree.language, query)
+                query_text = self._load_query(query_name)
+                parser_query = Query(tree.language, query_text)
                 captures = parser_query.captures(root_node)
 
                 for capture, nodes in captures.items():
                     try:
                         for node in nodes:
+                            if node.text is None:
+                                continue
+
                             text = node.text.decode("utf-8")
-                            if capture == "import":
-                                metadata["imports"].append(text)
-                            elif capture == "class_name":
-                                metadata["classes"].append(text)
-                            elif capture == "function_name":
-                                metadata["functions"].append(text)
-                            elif capture == "called_function":
-                                metadata["called_functions"].append(text)
-                                # Store line number for function calls
-                                line_number = node.start_point[0] + 1
-                                if "function_locations" not in metadata:
-                                    metadata["function_locations"] = {}
-                                if text not in metadata["function_locations"]:
-                                    metadata["function_locations"][text] = []
-                                metadata["function_locations"][text].append(line_number)
-                            elif capture == "decorator_name":
+
+                            # Variable categories
+                            if capture == "variable" or capture.startswith("variable."):
+                                metadata[capture].append(text)
+
+                            # Function/method categories
+                            elif capture == "function.method":
+                                metadata["function.method"].append(text)
+
+                            elif capture == "function.method.call":
+                                metadata["function.method.call"].append(text)
+
+                            # Type categories
+                            elif capture.startswith("type"):
+                                metadata[capture].append(text)
+
+                            # Module/namespace
+                            elif capture == "module":
+                                metadata["module"].append(text)
+                                metadata["namespace"].append(text)
+
+                            # Constant categories
+                            elif capture.startswith("constant"):
+                                metadata[capture].append(text)
+
+                            # Keyword categories
+                            elif capture.startswith("keyword"):
+                                metadata[capture].append(text)
+
+                            # Attribute/decorator categories
+                            elif capture.startswith("attribute"):
+                                metadata[capture].append(text)
+                                # Also add to decorators for backward compatibility
+                                if "decorators" not in metadata:
+                                    metadata["decorators"] = []
                                 metadata["decorators"].append(text)
-                            elif capture == "jsx_element":
-                                metadata["jsx_elements"].append(text)
-                            elif capture == "namespace_name":
-                                metadata["namespace"] = text
+
+                            # Other specific categories
+                            elif capture == "label":
+                                metadata["label"].append(text)
+                            elif capture == "operator":
+                                metadata["operator"].append(text)
+                            elif capture == "property":
+                                metadata["property"].append(text)
+                            elif capture == "constructor":
+                                metadata["constructor"].append(text)
+
+                            # else:
+                            #    logger.debug(f"Unhandled capture type: {capture} with value: {text}")
                     except Exception as node_err:
                         logger.debug(f"Error processing node: {node_err}")
                         continue
@@ -685,6 +712,9 @@ class RecursiveCodeChunker:
         """Initialize language-specific text splitters."""
         splitters = {}
 
+        # Import the Language enum from langchain_text_splitters
+        from langchain_text_splitters import Language
+
         # Create a default splitter for languages without specific support
         default_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.chunk_size,
@@ -694,38 +724,42 @@ class RecursiveCodeChunker:
 
         # Python splitter
         splitters[".py"] = RecursiveCharacterTextSplitter.from_language(
-            language="python",
+            language=Language.PYTHON,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
 
         # JavaScript/TypeScript splitters
         splitters[".js"] = RecursiveCharacterTextSplitter.from_language(
-            language="js", chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap
+            language=Language.JS,
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
         )
         splitters[".jsx"] = splitters[".js"]
         splitters[".ts"] = RecursiveCharacterTextSplitter.from_language(
-            language="ts", chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap
+            language=Language.TS,
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
         )
         splitters[".tsx"] = splitters[".ts"]
 
         # Java splitter
         splitters[".java"] = RecursiveCharacterTextSplitter.from_language(
-            language="java",
+            language=Language.JAVA,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
 
         # C# splitter
         splitters[".cs"] = RecursiveCharacterTextSplitter.from_language(
-            language="csharp",
+            language=Language.CSHARP,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
 
         # HTML splitter (XML has to use default)
         splitters[".html"] = RecursiveCharacterTextSplitter.from_language(
-            language="html",
+            language=Language.HTML,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
@@ -735,7 +769,7 @@ class RecursiveCodeChunker:
         try:
             # Try to use HTML as a fallback for XML formats
             xml_splitter = RecursiveCharacterTextSplitter.from_language(
-                language="html",  # Use HTML as proxy for XML-like languages
+                language=Language.HTML,  # Use HTML as proxy for XML-like languages
                 chunk_size=self.chunk_size,
                 chunk_overlap=self.chunk_overlap,
             )
@@ -753,7 +787,7 @@ class RecursiveCodeChunker:
 
         # Ruby splitter
         splitters[".rb"] = RecursiveCharacterTextSplitter.from_language(
-            language="ruby",
+            language=Language.RUBY,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
@@ -780,12 +814,12 @@ class RecursiveCodeChunker:
 
         # C/C++ splitters
         splitters[".c"] = RecursiveCharacterTextSplitter.from_language(
-            language="c",
+            language=Language.C,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
         splitters[".cpp"] = RecursiveCharacterTextSplitter.from_language(
-            language="cpp",
+            language=Language.CPP,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
@@ -793,7 +827,7 @@ class RecursiveCodeChunker:
 
         # Markdown splitter
         splitters[".md"] = RecursiveCharacterTextSplitter.from_language(
-            language="markdown",
+            language=Language.MARKDOWN,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
@@ -801,21 +835,21 @@ class RecursiveCodeChunker:
 
         # Go splitter
         splitters[".go"] = RecursiveCharacterTextSplitter.from_language(
-            language="go",
+            language=Language.GO,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
 
         # PHP splitter
         splitters[".php"] = RecursiveCharacterTextSplitter.from_language(
-            language="php",
+            language=Language.PHP,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
 
         # Rust splitter
         splitters[".rs"] = RecursiveCharacterTextSplitter.from_language(
-            language="rust",
+            language=Language.RUST,
             chunk_size=self.chunk_size,
             chunk_overlap=self.chunk_overlap,
         )
@@ -840,14 +874,46 @@ class RecursiveCodeChunker:
         splitter = self.get_splitter_for_file(file_path)
 
         # Extract code metadata if possible
-        namespace = None
         parent_class = None
         parent_function = None
-        called_functions = []
-        imports = []
-        namespace = ""
-        decorators = []
-        jsx_elements = []
+
+        # Initialize metadata variables
+        variable = []
+        variable_member = []
+        variable_parameter = []
+        variable_builtin = []
+
+        function_method = []
+        function_method_call = []
+
+        type_data = []
+        type_builtin = []
+        type_definition = []
+
+        module = []
+        namespace = []
+
+        constant = []
+        constant_macro = []
+        constant_builtin = []
+
+        keyword = []
+        keyword_conditional = []
+        keyword_repeat = []
+        keyword_return = []
+        keyword_operator = []
+        keyword_import = []
+        keyword_modifier = []
+        keyword_directive = []
+        keyword_exception = []
+
+        attribute = []
+        attribute_builtin = []
+
+        label = []
+        operator = []
+        property_data = []
+        constructor = []
 
         try:
             if content.encoding != "base64":
@@ -865,31 +931,145 @@ class RecursiveCodeChunker:
                     code_metadata = self.tree_sitter_chunker.extract_metadata(
                         file_content, file_path
                     )
-                    imports = code_metadata.get("imports", [])
-                    classes = code_metadata.get("classes", [])
-                    functions = code_metadata.get("functions", [])
-                    parent_class = classes[0] if classes else None
-                    parent_function = functions[0] if functions else None
-                    called_functions = code_metadata.get("called_functions", [])
-                    namespace = code_metadata.get("namespace", "")
-                    decorators = code_metadata.get("decorators", [])
-                    jsx_elements = code_metadata.get("jsx_elements", [])
 
-                    # Get function call locations directly from metadata
-                    function_call_locations = code_metadata.get(
-                        "function_locations", {}
+                    # Extract metadata using the new structure
+                    # Extract metadata fields from the new structure
+                    parent_class = None
+                    parent_function = None
+
+                    # Extract function and class-related metadata
+                    if code_metadata.get("type.definition"):
+                        parent_class = (
+                            code_metadata["type.definition"][0]
+                            if code_metadata["type.definition"]
+                            else None
+                        )
+
+                    if code_metadata.get("function.method"):
+                        parent_function = (
+                            code_metadata["function.method"][0]
+                            if code_metadata["function.method"]
+                            else None
+                        )
+
+                    # Extract common metadata fields - unqiue only
+                    variable = list(set(code_metadata.get("variable", [])))
+                    variable_member = list(
+                        set(code_metadata.get("variable.member", []))
                     )
+                    variable_parameter = list(
+                        set(code_metadata.get("variable.parameter", []))
+                    )
+                    variable_builtin = list(
+                        set(code_metadata.get("variable.builtin", []))
+                    )
+
+                    # Extract function-related metadata
+                    function_method = list(
+                        set(code_metadata.get("function.method", []))
+                    )
+                    function_method_call = list(
+                        set(code_metadata.get("function.method.call", []))
+                    )
+
+                    # Extract type-related metadata
+                    type_data = list(set(code_metadata.get("type", [])))
+                    type_builtin = list(set(code_metadata.get("type.builtin", [])))
+                    type_definition = list(
+                        set(code_metadata.get("type.definition", []))
+                    )
+
+                    # Extract other common metadata
+                    module = list(set(code_metadata.get("module", [])))
+                    namespace = list(set(code_metadata.get("namespace", [])))
+
+                    constant = list(set(code_metadata.get("constant", [])))
+                    constant_macro = list(set(code_metadata.get("constant.macro", [])))
+                    constant_builtin = list(
+                        set(code_metadata.get("constant.builtin", []))
+                    )
+
+                    keyword = list(set(code_metadata.get("keyword", [])))
+                    keyword_conditional = list(
+                        set(code_metadata.get("keyword.conditional", []))
+                    )
+                    keyword_repeat = list(set(code_metadata.get("keyword.repeat", [])))
+                    keyword_return = list(set(code_metadata.get("keyword.return", [])))
+                    keyword_operator = list(
+                        set(code_metadata.get("keyword.operator", []))
+                    )
+                    keyword_import = list(set(code_metadata.get("keyword.import", [])))
+                    keyword_modifier = list(
+                        set(code_metadata.get("keyword.modifier", []))
+                    )
+                    keyword_directive = list(
+                        set(code_metadata.get("keyword.directive", []))
+                    )
+                    keyword_exception = list(
+                        set(code_metadata.get("keyword.exception", []))
+                    )
+
+                    attribute = list(set(code_metadata.get("attribute", [])))
+                    attribute_builtin = list(
+                        set(code_metadata.get("attribute.builtin", []))
+                    )
+
+                    label = list(set(code_metadata.get("label", [])))
+                    operator = list(set(code_metadata.get("operator", [])))
+                    property_data = list(set(code_metadata.get("property", [])))
+                    constructor = list(set(code_metadata.get("constructor", [])))
                 except Exception as e:
                     logger.warning(f"Error extracting metadata from {file_path}: {e}")
-                    function_call_locations = {}
-            else:
-                function_call_locations = {}
+
+            # Create a metadata prefix for the file content
+            # We prepend the metadata to the file content as directly
+            # adding as tags may cause issues with length
+            metadata_prefix = self._create_metadata_prefix(
+                file_path=file_path,
+                repository=content.repository.name,
+                repo_url=content.html_url,
+                file_type=file_type,
+                parent_class=parent_class,
+                parent_function=parent_function,
+                variable=variable,
+                variable_member=variable_member,
+                variable_parameter=variable_parameter,
+                variable_builtin=variable_builtin,
+                function_method=function_method,
+                function_method_call=function_method_call,
+                type_data=type_data,
+                type_builtin=type_builtin,
+                type_definition=type_definition,
+                module=module,
+                namespace=namespace,
+                constant=constant,
+                constant_macro=constant_macro,
+                constant_builtin=constant_builtin,
+                keyword=keyword,
+                keyword_conditional=keyword_conditional,
+                keyword_repeat=keyword_repeat,
+                keyword_return=keyword_return,
+                keyword_operator=keyword_operator,
+                keyword_import=keyword_import,
+                keyword_modifier=keyword_modifier,
+                keyword_directive=keyword_directive,
+                keyword_exception=keyword_exception,
+                attribute=attribute,
+                attribute_builtin=attribute_builtin,
+                label=label,
+                operator=operator,
+                property_data=property_data,
+                constructor=constructor,
+            )
+
+            # Prepend the metadata to the file content
+            enhanced_content = metadata_prefix + "\n\n" + file_content
 
             # Chunk the text
             chunks = []
             try:
                 # Split the text into chunks
-                text_chunks = splitter.split_text(file_content)
+                text_chunks = splitter.split_text(enhanced_content)
 
                 # Create CodeChunk objects
                 for i, chunk_text in enumerate(text_chunks):
@@ -905,16 +1085,8 @@ class RecursiveCodeChunker:
                     )
                     end_line = start_line + chunk_text.count("\n")
 
-                    # Find functions called specifically in this chunk's line range
-                    chunk_called_functions = set()
-                    for func_name, line_nums in function_call_locations.items():
-                        # Check if any instances of this function are called in the chunk's line range
-                        if any(
-                            start_line <= line_num <= end_line for line_num in line_nums
-                        ):
-                            chunk_called_functions.add(func_name)
-
                     # Create chunk with chunk-specific called functions
+                    # Create a chunk with all extracted metadata
                     chunk = CodeChunk(
                         text=chunk_text,
                         file_path=file_path,
@@ -924,17 +1096,10 @@ class RecursiveCodeChunker:
                         file_type=file_type,
                         parent_class=parent_class,
                         parent_function=parent_function,
-                        namespace=namespace,
-                        called_functions=list(
-                            chunk_called_functions
-                        ),  # Only functions called in this chunk
-                        imports=imports,
                         start_line=start_line,
                         end_line=end_line,
                         updated_at=content.last_modified_datetime
                         or datetime.now(timezone.utc),
-                        decorators=decorators,
-                        jsx_elements=jsx_elements,
                     )
                     chunks.append(chunk)
 
@@ -942,11 +1107,7 @@ class RecursiveCodeChunker:
                 logger.error(f"Error chunking file {file_path}: {e}")
                 # Fall back to creating a single chunk with the entire file
                 chunk_id = f"{content.html_url}:0"
-                # For the fallback, use the simple set approach
-                # Create a set to remove duplicates and keep just up to 10 most relevant functions
-                # Get the 10 most frequently occurring functions
-                func_counter = Counter(called_functions)
-                unique_funcs = [func for func, _ in func_counter.most_common(10)]
+
                 chunk = CodeChunk(
                     text=file_content,
                     file_path=file_path,
@@ -956,15 +1117,10 @@ class RecursiveCodeChunker:
                     file_type=file_type,
                     parent_class=parent_class,
                     parent_function=parent_function,
-                    namespace=namespace,
-                    called_functions=unique_funcs,
-                    imports=imports,
                     start_line=1,
                     end_line=file_content.count("\n") + 1,
                     updated_at=content.last_modified_datetime
                     or datetime.now(timezone.utc),
-                    decorators=decorators,
-                    jsx_elements=jsx_elements,
                 )
                 chunks.append(chunk)
 
@@ -973,6 +1129,202 @@ class RecursiveCodeChunker:
         except Exception as e:
             logger.warning(f"Error processing file {file_path}: {e}")
             return []  # Return empty list instead of failing
+
+    def _create_metadata_prefix(self, **kwargs: Any) -> str:
+        """
+        Create a metadata prefix with file information similar to Repomix.
+
+        Args:
+            Various metadata fields extracted from the file
+
+        Returns:
+            Formatted string with metadata information
+        """
+        file_path = kwargs.get("file_path", "")
+        repository = kwargs.get("repository", "")
+        repo_url = kwargs.get("repo_url", "")
+        file_type = kwargs.get("file_type", "")
+        parent_class = kwargs.get("parent_class", "")
+        parent_function = kwargs.get("parent_function", "")
+
+        # Extract all metadata fields
+        variable = kwargs.get("variable", [])
+        variable_member = kwargs.get("variable_member", [])
+        variable_parameter = kwargs.get("variable_parameter", [])
+        variable_builtin = kwargs.get("variable_builtin", [])
+
+        function_method = kwargs.get("function_method", [])
+        function_method_call = kwargs.get("function_method_call", [])
+
+        type_data = kwargs.get("type_data", [])
+        type_builtin = kwargs.get("type_builtin", [])
+        type_definition = kwargs.get("type_definition", [])
+
+        module = kwargs.get("module", [])
+        namespace = kwargs.get("namespace", [])
+
+        constant = kwargs.get("constant", [])
+        constant_macro = kwargs.get("constant_macro", [])
+        constant_builtin = kwargs.get("constant_builtin", [])
+
+        keyword = kwargs.get("keyword", [])
+        keyword_conditional = kwargs.get("keyword_conditional", [])
+        keyword_repeat = kwargs.get("keyword_repeat", [])
+        keyword_return = kwargs.get("keyword_return", [])
+        keyword_operator = kwargs.get("keyword_operator", [])
+        keyword_import = kwargs.get("keyword_import", [])
+        keyword_modifier = kwargs.get("keyword_modifier", [])
+        keyword_directive = kwargs.get("keyword_directive", [])
+        keyword_exception = kwargs.get("keyword_exception", [])
+
+        attribute = kwargs.get("attribute", [])
+        attribute_builtin = kwargs.get("attribute_builtin", [])
+
+        label = kwargs.get("label", [])
+        operator = kwargs.get("operator", [])
+        property_data = kwargs.get("property_data", [])
+        constructor = kwargs.get("constructor", [])
+
+        # Build the prefix
+        prefix = [
+            f"# Code File: {file_path}",
+            f"Repository: {repository}",
+            f"URL: {repo_url}",
+            f"File Type: {file_type}",
+        ]
+
+        # Add classes and functions
+        if parent_class:
+            prefix.append(f"Primary Class: {parent_class}")
+        if parent_function:
+            prefix.append(f"Primary Function: {parent_function}")
+
+        # Add key metadata sections
+        if type_definition:
+            prefix.append("\n## Type Definitions")
+            prefix.append(", ".join(type_definition))
+
+        if function_method:
+            prefix.append("\n## Functions/Methods")
+            prefix.append(", ".join(function_method))
+
+        if function_method_call:
+            prefix.append("\n## Function Calls")
+            prefix.append(", ".join(function_method_call))
+
+        if variable:
+            prefix.append("\n## Variables")
+            prefix.append(", ".join(variable))
+
+        if module:
+            prefix.append("\n## Modules/Imports")
+            prefix.append(", ".join(module))
+
+        # Add additional metadata sections
+        if variable_member:
+            prefix.append("\n## Member Variables")
+            prefix.append(", ".join(variable_member))
+
+        if variable_parameter:
+            prefix.append("\n## Parameters")
+            prefix.append(", ".join(variable_parameter))
+
+        if variable_builtin:
+            prefix.append("\n## Built-in Variables")
+            prefix.append(", ".join(variable_builtin))
+
+        if type_data:
+            prefix.append("\n## Types")
+            prefix.append(", ".join(type_data))
+
+        if type_builtin:
+            prefix.append("\n## Built-in Types")
+            prefix.append(", ".join(type_builtin))
+
+        if namespace:
+            prefix.append("\n## Namespaces")
+            prefix.append(", ".join(namespace))
+
+        if constant:
+            prefix.append("\n## Constants")
+            prefix.append(", ".join(constant))
+
+        if constant_macro:
+            prefix.append("\n## Macros")
+            prefix.append(", ".join(constant_macro))
+
+        if constant_builtin:
+            prefix.append("\n## Built-in Constants")
+            prefix.append(", ".join(constant_builtin))
+
+        if keyword:
+            prefix.append("\n## Keywords")
+            prefix.append(", ".join(keyword))
+
+        if keyword_conditional:
+            prefix.append("\n## Conditional Keywords")
+            prefix.append(", ".join(keyword_conditional))
+
+        if keyword_repeat:
+            prefix.append("\n## Loop Keywords")
+            prefix.append(", ".join(keyword_repeat))
+
+        if keyword_return:
+            prefix.append("\n## Return Keywords")
+            prefix.append(", ".join(keyword_return))
+
+        if keyword_operator:
+            prefix.append("\n## Operator Keywords")
+            prefix.append(", ".join(keyword_operator))
+
+        if keyword_import:
+            prefix.append("\n## Import Keywords")
+            prefix.append(", ".join(keyword_import))
+
+        if keyword_modifier:
+            prefix.append("\n## Modifier Keywords")
+            prefix.append(", ".join(keyword_modifier))
+
+        if keyword_directive:
+            prefix.append("\n## Directive Keywords")
+            prefix.append(", ".join(keyword_directive))
+
+        if keyword_exception:
+            prefix.append("\n## Exception Keywords")
+            prefix.append(", ".join(keyword_exception))
+
+        if attribute:
+            prefix.append("\n## Attributes/Decorators")
+            prefix.append(", ".join(attribute))
+
+        if attribute_builtin:
+            prefix.append("\n## Built-in Attributes")
+            prefix.append(", ".join(attribute_builtin))
+
+        if label:
+            prefix.append("\n## Labels")
+            prefix.append(", ".join(label))
+
+        if operator:
+            prefix.append("\n## Operators")
+            prefix.append(", ".join(operator))
+
+        if property_data:
+            prefix.append("\n## Properties")
+            prefix.append(", ".join(property_data))
+
+        if constructor:
+            prefix.append("\n## Constructors")
+            prefix.append(", ".join(constructor))
+
+        # Add code summary section
+        prefix.append("\n## Code Summary")
+        prefix.append(
+            "This chunk contains source code from the file. The metadata above provides a summary of key elements in the file."
+        )
+        prefix.append("---")
+
+        return "\n".join(prefix)
 
 
 class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
@@ -1095,7 +1447,7 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
         self.max_workers = max_workers
 
         # Initialize chunker
-        tree_sitter_chunker = TreeSitterChunker(language_dir="./tree-sitter-grammars")
+        tree_sitter_chunker = TreeSitterChunker(query_dir="./queries")
         self.code_chunker = RecursiveCodeChunker(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
@@ -1524,12 +1876,16 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
                 current_path
             )  # Fetch contents of the directory
 
+            # Fix for handling both ContentFile and list[ContentFile] return types
+            if not isinstance(contents, list):
+                # If contents is a single file, convert it to a list
+                contents = [contents]
+
             checkpoint.curr_page += 1
 
-            logger.info(
-                f"Processing directory: {current_path}, stack size: {len(checkpoint.directory_stack)}"
-            )
+            logger.info(f"Stack size: {len(checkpoint.directory_stack)}")
             logger.info(f"Current directory stack: {checkpoint.directory_stack}")
+            logger.info(f"Processing directory: {current_path}")
             logger.info(f"Found {len(contents)} items in {current_path}")
 
             for content in contents:
