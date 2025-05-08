@@ -1890,14 +1890,11 @@ class GithubSourceConnector(CheckpointedConnector[GithubConnectorCheckpoint]):
 
             for content in contents:
                 # Skip files updated before the start date
-                # if start is not None and content.last_modified_datetime < start:
-                #     #yield from doc_batch
-                #     #done_with_contents = True
-                #     #break
-                #     continue
-                # # Skip files updated after the end date
-                # if end is not None and content.last_modified_datetime > end:
-                #     continue
+                if start is not None and content.last_modified_datetime < start:
+                    continue
+                # Skip files updated after the end date
+                if end is not None and content.last_modified_datetime > end:
+                    continue
 
                 if content.type == "dir":
                     # Add the directory's path to the stack
